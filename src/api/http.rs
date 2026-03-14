@@ -463,7 +463,7 @@ pub async fn start_server(state: AppState, port: u16, rate_limit_per_minute: u32
     info!("HTTP server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }
