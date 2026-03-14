@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:1.85-slim-bookworm AS builder
 
 LABEL org.opencontainers.image.source="https://github.com/nostr-wot/nostr-wot-oracle"
 LABEL org.opencontainers.image.description="Pairwise distance queries for Nostr Web of Trust"
