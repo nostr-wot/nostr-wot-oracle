@@ -151,6 +151,9 @@ Relay C ──┘                       │
 - Stores `(created_at, event_id)` to detect older/duplicate events
 - Checked before parsing tags (CPU-intensive)
 
+> For the full sync process including relay discovery, multi-source event verification,
+> batched subscriptions, and progressive depth crawling, see **[SYNC.md](SYNC.md)**.
+
 ### SQLite Persistence
 
 **Location:** `src/db/sqlite.rs`
@@ -241,6 +244,20 @@ NIP-90 Data Vending Machine interface for Nostr-native queries.
 2. Parse request: `["i", "<from>"]`, `["param", "target", "<to>"]`
 3. Compute distance
 4. Publish kind:6950 response signed with DVM key
+
+### Relay Discovery
+
+**Status:** Not yet implemented — see [SYNC.md](SYNC.md) for the proposed strategy.
+
+**Current:** Static relays configured via `RELAYS` env var (default: `damus.io`, `nos.lol`, `nostr.band`). All relays queried uniformly for all users.
+
+**Planned:** Dynamic relay discovery using the outbox model:
+
+1. **NIP-65 (kind:10002)** — Fetch user's declared read/write relays from `purplepag.es` or `relay.nostr.band`
+2. **Kind:3 relay hints** — Extract relay URLs from p-tag position 2 (`["p", pubkey, relay_url, petname]`)
+3. **Fallback** — Seed relays for users without relay metadata
+
+This enables targeted subscriptions (fewer relays, more relevant data) and ensures we find events from users who publish to non-default relays.
 
 ## Data Flow
 
