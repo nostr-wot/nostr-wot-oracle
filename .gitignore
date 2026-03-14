@@ -33,7 +33,6 @@ logs/
 # Claude Code
 .claude/
 .claudeignore
-CLAUDE.md
 claude.json
 .claude.json
 

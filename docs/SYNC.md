@@ -12,13 +12,14 @@ This document describes how WoT Oracle discovers follow relationships and relays
 - [Batched Subscriptions](#batched-subscriptions)
 - [Progressive Depth Crawling](#progressive-depth-crawling)
 - [Data Flow Diagrams](#data-flow-diagrams)
+- [Profile Ingestion (kind:0)](#profile-ingestion-kind0)
 - [Configuration](#configuration)
 
 ---
 
 ## Overview
 
-WoT Oracle builds a global follow graph by ingesting `kind:3` (contact list / NIP-02) events from the Nostr network. The core challenges are:
+WoT Oracle builds a global follow graph by ingesting `kind:3` (contact list / NIP-02) events from the Nostr network and caches user profile metadata by ingesting `kind:0` (profile / NIP-01) events. The core challenges are:
 
 1. **Finding follow lists** — Where do we fetch a user's kind:3 event from?
 2. **Relay discovery** — How do we know which relays a user publishes to?
@@ -32,6 +33,7 @@ WoT Oracle builds a global follow graph by ingesting `kind:3` (contact list / NI
 | Aspect | Status | Details |
 |--------|--------|---------|
 | Kind:3 ingestion | ✅ | Subscribes to kind:3 events across configured relays |
+| Kind:0 ingestion | ✅ | Subscribes to kind:0 events for profile caching alongside kind:3 |
 | Deduplication | ✅ | LRU cache (100k entries) by pubkey bytes, skips older events |
 | Timestamp validation | ✅ | Graph only accepts events newer than the stored `created_at` |
 | Batch persistence | ✅ | 100 events per SQLite transaction, 5-second flush timeout |
@@ -468,6 +470,53 @@ Need events from user X
 | Subscription model | 1 global filter for all kind:3 | Batched per-relay, grouped by author |
 | Depth control | None (all events) | Progressive level-by-level crawl |
 | Network efficiency | Low (broad firehose) | High (targeted, batched, grouped) |
+
+---
+
+## Profile Ingestion (kind:0)
+
+WoT Oracle ingests `kind:0` (user metadata / NIP-01) events to populate the profile cache. Profile data (display name, picture URL, NIP-05 identifier, about text, etc.) is made available through the `/profiles` endpoint and via the `include_profiles` parameter on other endpoints.
+
+### Ingestion Sources
+
+Profiles are ingested through two mechanisms:
+
+1. **Relay subscription (continuous):** The same relay connections used for kind:3 events also subscribe to kind:0 events. As profiles stream in from connected relays, they are processed and cached alongside follow lists.
+
+2. **purplepag.es batch fetch (bootstrap):** During initial sync and progressive depth crawling, `purplepag.es` is queried in batch for kind:0 events of discovered pubkeys. This is particularly effective because `purplepag.es` serves as a directory relay that aggregates kind:0 and kind:10002 events from across the network.
+
+### Deduplication
+
+Profile events follow the same deduplication pattern as kind:3 events:
+
+- **LRU dedup cache:** An LRU cache keyed by pubkey bytes stores `(created_at, event_id)` tuples. Incoming kind:0 events are checked against this cache and rejected if already seen or older than the cached entry.
+- **Timestamp validation:** The profile cache only accepts events with a `created_at` newer than the currently stored profile for that pubkey, ensuring stale profiles never overwrite fresher ones.
+- **Replaceable event semantics:** Kind:0 is a replaceable event (per NIP-01), so only the latest version per pubkey is retained. The same conflict resolution rules apply: highest `created_at` wins, lowest event `id` breaks ties.
+
+### Sync Flow
+
+```
+Relay subscription (kind:0)
+    │
+    ▼
+Event arrives ──▶ LRU dedup check ──▶ Parse JSON content ──▶ Profile cache update ──▶ Persist queue
+                   (skip if older)    (name, picture, etc.)   (if newer)                (batch of 100)
+
+purplepag.es batch fetch
+    │
+    ▼
+{ kinds: [0], authors: [pubkey1, pubkey2, ...] }
+    │
+    ▼
+Responses ──▶ Same pipeline as above
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROFILE_CACHE_SIZE` | `50000` | Maximum number of profiles in the in-memory LRU cache |
+| `PROFILE_CACHE_TTL_SECS` | `3600` | Time-to-live for cached profile entries (1 hour) |
 
 ---
 

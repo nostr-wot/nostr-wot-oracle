@@ -8,7 +8,7 @@ A high-performance Nostr Web of Trust oracle that indexes the global follow grap
 
 ## What It Does
 
-WoT Oracle continuously syncs follow lists (kind:3 events) from Nostr relays and builds an in-memory graph. You can then query the "social distance" between any two pubkeys - how many hops through the follow graph connect them.
+WoT Oracle continuously syncs follow lists (kind:3 events) from Nostr relays and builds an in-memory graph. You can then query the "social distance" between any two pubkeys - how many hops through the follow graph connect them. It also caches kind:0 profile metadata (name, picture, NIP-05, etc.) and can return cached profiles alongside distance queries via the `include_profiles` parameter or the dedicated `/profiles` endpoint.
 
 **Example:** If Alice follows Bob, and Bob follows Carol, then the distance from Alice to Carol is 2 hops.
 
@@ -70,6 +70,12 @@ Response:
 }
 ```
 
+Include cached profile metadata in the response:
+
+```bash
+curl "http://localhost:8080/distance?from=PUBKEY1&to=PUBKEY2&include_profiles=true"
+```
+
 ### Batch Query
 
 ```bash
@@ -96,6 +102,12 @@ curl "http://localhost:8080/common-follows?from=PUBKEY1&to=PUBKEY2"
 curl "http://localhost:8080/path?from=PUBKEY1&to=PUBKEY2"
 ```
 
+### Get Profiles
+
+```bash
+curl "http://localhost:8080/profiles?pubkeys=PUBKEY1,PUBKEY2"
+```
+
 ### Graph Stats
 
 ```bash
@@ -113,6 +125,8 @@ curl http://localhost:8080/stats
 | `MAX_HOPS` | 3 | Default max hops for distance queries (1-5) |
 | `CACHE_SIZE` | 10000 | LRU cache entries |
 | `CACHE_TTL_SECS` | 300 | Cache TTL (5 min) |
+| `PROFILE_CACHE_SIZE` | 50000 | Profile cache LRU entries |
+| `PROFILE_CACHE_TTL_SECS` | 3600 | Profile cache TTL (1 hour) |
 
 See [.env.example](.env.example) for all options.
 
@@ -122,6 +136,7 @@ See [.env.example](.env.example) for all options.
 - [DVM Interface](docs/DVM.md) - NIP-90 Nostr integration
 - [Self-Hosting Guide](docs/SELF-HOST.md) - Docker deployment guide
 - [Architecture](docs/ARCHITECTURE.md) - How it works internally
+- [Sync & Relay Discovery](docs/SYNC.md) - Sync process and relay discovery strategy
 
 ## Performance
 

@@ -61,6 +61,7 @@ Query the social distance between two pubkeys.
 | `max_hops` | integer | No | 3 | Maximum hops to search (1-5) |
 | `include_bridges` | boolean | No | false | Include bridge node pubkeys |
 | `bypass_cache` | boolean | No | false | Skip cache, force fresh computation |
+| `include_profiles` | boolean | No | false | Include cached kind:0 profile metadata for all pubkeys in the response |
 
 **Example:**
 ```bash
@@ -134,6 +135,7 @@ Query distances from one pubkey to multiple targets in a single request.
 | `max_hops` | integer | No | 3 | Maximum hops to search (1-5) |
 | `include_bridges` | boolean | No | false | Include bridge node pubkeys |
 | `bypass_cache` | boolean | No | false | Skip cache, force fresh computation |
+| `include_profiles` | boolean | No | false | Include cached kind:0 profile metadata for all pubkeys in the response |
 
 **Example:**
 ```bash
@@ -175,6 +177,7 @@ Returns the list of pubkeys that a given pubkey follows.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `pubkey` | string | Yes | The pubkey to get follows for (64 hex chars) |
+| `include_profiles` | boolean | No | Include cached kind:0 profile metadata for all pubkeys in the response |
 
 **Example:**
 ```bash
@@ -204,6 +207,7 @@ Returns the list of pubkeys that both `from` and `to` follow (mutual follows).
 |------|------|----------|-------------|
 | `from` | string | Yes | First pubkey (64 hex chars) |
 | `to` | string | Yes | Second pubkey (64 hex chars) |
+| `include_profiles` | boolean | No | Include cached kind:0 profile metadata for all pubkeys in the response |
 
 **Example:**
 ```bash
@@ -234,6 +238,7 @@ Returns the shortest path between two pubkeys as an array of intermediate pubkey
 | `from` | string | Yes | - | Source pubkey (64 hex chars) |
 | `to` | string | Yes | - | Target pubkey (64 hex chars) |
 | `max_hops` | integer | No | 3 | Maximum hops to search (1-5) |
+| `include_profiles` | boolean | No | false | Include cached kind:0 profile metadata for all pubkeys in the response |
 
 **Example:**
 ```bash
@@ -264,6 +269,61 @@ curl "http://localhost:8080/path?from=82341f...&to=3bf0c6..."
 - If the path is `from -> A -> to`, path is `["A"]`
 - If the path is `from -> A -> B -> to`, path is `["A", "B"]`
 - If no path exists within `max_hops`, path is `null`
+
+---
+
+### GET /profiles
+
+Returns cached kind:0 profile metadata for the requested pubkeys.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `pubkeys` | string | Yes | Comma-separated list of pubkeys (64 hex chars each, max 100) |
+
+**Example:**
+```bash
+curl "http://localhost:8080/profiles?pubkeys=82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2,3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+```
+
+**Response:**
+```json
+{
+  "profiles": {
+    "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2": {
+      "name": "Alice",
+      "picture": "https://example.com/alice.jpg",
+      "nip05": "alice@example.com"
+    },
+    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d": {
+      "name": "Bob",
+      "picture": "https://example.com/bob.jpg",
+      "nip05": "bob@example.com"
+    }
+  }
+}
+```
+
+**Notes:**
+- Only profiles that exist in the cache are returned; missing pubkeys are silently omitted.
+- Maximum 100 pubkeys per request.
+
+---
+
+### Profile Responses
+
+When `include_profiles=true` is set on any endpoint, the response includes a `profiles` map containing cached kind:0 metadata for all pubkeys referenced in the response (source, target, bridges, follows, path nodes, etc.):
+
+```json
+{
+  "profiles": {
+    "abc...": { "name": "Alice", "picture": "https://...", "nip05": "alice@example.com" }
+  }
+}
+```
+
+**Note:** A maximum of 500 profiles are returned per response (`MAX_PROFILE_RESULTS`). If the response references more pubkeys than this limit, profiles are returned for the most relevant pubkeys (source, target, and bridge/path nodes take priority).
 
 ---
 

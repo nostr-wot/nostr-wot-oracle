@@ -5,26 +5,31 @@ This document describes the internal architecture of WoT Oracle.
 ## Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         WoT Oracle                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
-│  │   Ingestion  │───▶│   WotGraph   │◀───│   HTTP API   │      │
-│  │    Daemon    │    │  (In-Memory) │    │    (Axum)    │      │
-│  └──────┬───────┘    └──────────────┘    └──────────────┘      │
-│         │                   │                    │              │
-│         │            ┌──────┴──────┐            │              │
-│         │            │    Cache    │            │              │
-│         │            │   (Moka)    │            │              │
-│         │            └─────────────┘            │              │
-│         │                                       │              │
-│  ┌──────▼───────┐                      ┌───────▼──────┐       │
-│  │    SQLite    │                      │  DVM Service │       │
-│  │  (Persist)   │                      │   (NIP-90)   │       │
-│  └──────────────┘                      └──────────────┘       │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                            WoT Oracle                                │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+│  │   Ingestion  │───▶│   WotGraph   │◀───│   HTTP API   │           │
+│  │    Daemon    │    │  (In-Memory) │    │    (Axum)    │           │
+│  └──────┬───────┘    └──────────────┘    └──────┬───────┘           │
+│         │                   │                   │                    │
+│         │            ┌──────┴──────┐     ┌──────┴───────┐           │
+│         │            │    Cache    │     │ ProfileCache │           │
+│         │            │   (Moka)    │     │   (Moka)     │           │
+│         │            └─────────────┘     └──────┬───────┘           │
+│         │                                       │                    │
+│  ┌──────▼───────────────────────────────────────▼──────┐            │
+│  │                     SQLite                          │            │
+│  │          (Graph Persist + Profile Store)             │            │
+│  └─────────────────────────────────────────────────────┘            │
+│                                                                      │
+│  ┌──────────────┐                                                    │
+│  │  DVM Service │                                                    │
+│  │   (NIP-90)   │                                                    │
+│  └──────────────┘                                                    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
          │                                        │
          ▼                                        ▼
    ┌──────────┐                            ┌──────────┐
@@ -122,16 +127,33 @@ pub struct CacheKey {
 - **TTL-based expiration:** Entries expire after configured TTL; no automatic invalidation on graph changes
 - **Lock-free reads:** Moka provides concurrent access without blocking
 
+### Profile Cache
+
+The profile cache stores kind:0 (user metadata) events so that API responses can include human-readable profile information (display name, picture, NIP-05 identifier, etc.) alongside graph query results.
+
+**Storage layers:**
+
+1. **Moka LRU cache (hot layer):** In-memory cache with configurable size (`PROFILE_CACHE_SIZE`, default 50,000 entries) and TTL (`PROFILE_CACHE_TTL_SECS`, default 3,600 seconds). Provides sub-millisecond lookups for frequently accessed profiles.
+
+2. **SQLite (cold layer):** All ingested profiles are persisted to a `profiles` table in the same SQLite database used for graph persistence. On cache miss, the profile is loaded from SQLite into the Moka cache before being returned to the caller.
+
+**Key design points:**
+
+- Profiles are keyed by pubkey and store the parsed JSON content of the kind:0 event along with the `created_at` timestamp.
+- Only the latest profile per pubkey is retained (same replaceable-event semantics as kind:3).
+- The API enforces a `MAX_PROFILE_RESULTS` limit of 500 profiles per response to bound payload size.
+- Profile lookups are non-blocking and never delay distance computation; if a profile is not cached, it is simply omitted from the response.
+
 ### Ingestion Daemon
 
 **Location:** `src/sync/ingestion.rs`
 
-Continuously syncs kind:3 (contact list) events from relays.
+Continuously syncs kind:3 (contact list) and kind:0 (profile metadata) events from relays.
 
 ```
 Relay A ──┐
-Relay B ──┼──▶ Event Stream ──▶ Dedup ──▶ Graph Update ──▶ Persist Queue
-Relay C ──┘                       │
+Relay B ──┼──▶ Event Stream ──▶ Dedup ──▶ kind:3 ──▶ Graph Update ──▶ Persist Queue
+Relay C ──┘                       │       kind:0 ──▶ Profile Cache ──▶ Persist Queue
                                   │
                             LRU Cache
                         (pubkey → latest event)
@@ -140,10 +162,12 @@ Relay C ──┘                       │
 **Event Processing:**
 
 1. **Early Dedup:** LRU cache keyed by pubkey bytes rejects already-seen events
-2. **Tag Parsing:** Extract p-tags to get follow list
-3. **Timestamp Check:** Only process if newer than existing event for pubkey
-4. **Graph Update:** Diff old/new follows, update adjacency lists
-5. **Async Persist:** Send to background worker for SQLite batching
+2. **Kind Dispatch:** Route kind:3 events to follow-graph processing, kind:0 events to profile cache processing
+3. **Tag Parsing (kind:3):** Extract p-tags to get follow list
+4. **Content Parsing (kind:0):** Parse JSON content to extract profile fields (name, picture, nip05, about, etc.)
+5. **Timestamp Check:** Only process if newer than existing event for pubkey
+6. **Graph/Profile Update:** For kind:3, diff old/new follows and update adjacency lists; for kind:0, update profile cache entry
+7. **Async Persist:** Send to background worker for SQLite batching
 
 **Deduplication:**
 
