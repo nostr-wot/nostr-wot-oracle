@@ -30,7 +30,7 @@ curl http://localhost:8080/health
 ```bash
 # Clone and start
 git clone https://github.com/nostr-wot/nostr-wot-oracle.git
-cd wot-oracle
+cd nostr-wot-oracle
 docker-compose up -d
 
 # Check health
@@ -78,6 +78,24 @@ curl -X POST http://localhost:8080/distance/batch \
   -d '{"from": "PUBKEY1", "targets": ["PUBKEY2", "PUBKEY3"]}'
 ```
 
+### Get Follows
+
+```bash
+curl "http://localhost:8080/follows?pubkey=PUBKEY"
+```
+
+### Get Common Follows
+
+```bash
+curl "http://localhost:8080/common-follows?from=PUBKEY1&to=PUBKEY2"
+```
+
+### Get Shortest Path
+
+```bash
+curl "http://localhost:8080/path?from=PUBKEY1&to=PUBKEY2"
+```
+
 ### Graph Stats
 
 ```bash
@@ -92,6 +110,7 @@ curl http://localhost:8080/stats
 | `HTTP_PORT` | 8080 | HTTP server port |
 | `DB_PATH` | wot.db | SQLite database path |
 | `RATE_LIMIT_PER_MINUTE` | 100 | Per-IP rate limit |
+| `MAX_HOPS` | 3 | Default max hops for distance queries (1-5) |
 | `CACHE_SIZE` | 10000 | LRU cache entries |
 | `CACHE_TTL_SECS` | 300 | Cache TTL (5 min) |
 

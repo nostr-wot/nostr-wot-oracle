@@ -32,14 +32,16 @@ Returns graph statistics and cache metrics.
   "nodes_with_follows": 120000,
   "cache": {
     "size": 5432,
-    "hits": 12345,
-    "misses": 678
+    "capacity": 10000,
+    "ttl_secs": 300
   },
   "locks": {
-    "read_count": 100000,
-    "write_count": 5000,
-    "read_wait_ns": 123456,
-    "write_wait_ns": 78901
+    "write_lock_count": 5000,
+    "write_lock_avg_us": 12,
+    "write_lock_max_us": 450,
+    "read_lock_count": 100000,
+    "read_lock_avg_us": 2,
+    "read_lock_max_us": 85
   }
 }
 ```
@@ -93,15 +95,14 @@ curl "http://localhost:8080/distance?from=82341f...&to=3bf0c6...&include_bridges
 **Error Response:**
 ```json
 {
-  "error": "Invalid pubkey length: expected 64, got 32",
-  "code": "INVALID_PUBKEY_LENGTH"
+  "error": "Invalid pubkey format",
+  "code": "INVALID_PUBKEY"
 }
 ```
 
 **Error Codes:**
-- `INVALID_PUBKEY_LENGTH` - Pubkey must be 64 characters
-- `INVALID_PUBKEY_FORMAT` - Pubkey must be hexadecimal
-- `INVALID_MAX_HOPS` - max_hops must be 1-10
+- `INVALID_PUBKEY` - Invalid pubkey format
+- `INVALID_MAX_HOPS` - max_hops must be 1-5
 - `INTERNAL_ERROR` - Server error
 
 ---
@@ -318,6 +319,6 @@ Enable DVM with `DVM_ENABLED=true` and `DVM_PRIVATE_KEY=<nsec or hex>`.
 Query results are cached in an LRU cache with configurable size and TTL.
 
 - **Cache Key:** (from_id, to_id, max_hops, include_bridges)
-- **Invalidation:** Cache entries are invalidated when either node's follow list changes
+- **Invalidation:** Cache entries expire after CACHE_TTL_SECS (default 300s). No automatic invalidation on graph changes.
 
 Use `bypass_cache=true` to force fresh computation.

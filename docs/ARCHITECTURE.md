@@ -16,7 +16,7 @@ This document describes the internal architecture of WoT Oracle.
 │         │                   │                    │              │
 │         │            ┌──────┴──────┐            │              │
 │         │            │    Cache    │            │              │
-│         │            │ (LRU+Moka)  │            │              │
+│         │            │   (Moka)    │            │              │
 │         │            └─────────────┘            │              │
 │         │                                       │              │
 │  ┌──────▼───────┐                      ┌───────▼──────┐       │
@@ -117,9 +117,9 @@ pub struct CacheKey {
 
 **Features:**
 
-- **Compact Keys:** Uses node IDs (8 bytes) instead of pubkey strings (128 bytes)
+- **Compact Keys:** Uses node IDs (10 bytes) instead of pubkey strings (128 bytes)
 - **TTL Expiration:** Configurable via `CACHE_TTL_SECS`
-- **Invalidation:** Graph epoch increments on updates; stale entries rejected
+- **TTL-based expiration:** Entries expire after configured TTL; no automatic invalidation on graph changes
 - **Lock-free reads:** Moka provides concurrent access without blocking
 
 ### Ingestion Daemon
@@ -214,7 +214,7 @@ Request
          │
          ▼
 ┌──────────────────┐
-│     Router       │  /health, /stats, /distance, /distance/batch
+│     Router       │  /health, /stats, /distance, /distance/batch, /follows, /common-follows, /path
 └────────┬─────────┘
          │
          ▼

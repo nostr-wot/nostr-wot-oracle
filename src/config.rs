@@ -11,7 +11,7 @@ pub const RATE_LIMIT_DEFAULT: u32 = 100;
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const REQUEST_BODY_LIMIT: usize = 1024 * 1024; // 1MB
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub relays: Vec<String>,
     pub http_port: u16,
@@ -85,5 +85,21 @@ impl Config {
             cache_size,
             cache_ttl_secs,
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("relays", &self.relays)
+            .field("http_port", &self.http_port)
+            .field("db_path", &self.db_path)
+            .field("dvm_enabled", &self.dvm_enabled)
+            .field("dvm_private_key", &self.dvm_private_key.as_ref().map(|_| "[REDACTED]"))
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("max_hops", &self.max_hops)
+            .field("cache_size", &self.cache_size)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .finish()
     }
 }

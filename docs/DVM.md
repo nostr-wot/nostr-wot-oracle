@@ -118,7 +118,6 @@ Use individual `param` tags for each value:
   "tags": [
     ["e", "<request_event_id>"],
     ["p", "<requester_pubkey>"],
-    ["request", "<original_request_json>"],
     ["result", "2", "hops"]
   ],
   "content": "{\"from\":\"82341f...\",\"to\":\"3bf0c6...\",\"hops\":2,\"path_count\":7,\"mutual_follow\":false,\"bridges\":[\"fa984b...\"]}",
@@ -133,7 +132,6 @@ Use individual `param` tags for each value:
 |-----|-------------|
 | `e` | References the request event ID |
 | `p` | References the requester's pubkey |
-| `request` | JSON of the original request (for verification) |
 | `result` | Hop count (if path found) |
 
 ### Content JSON
@@ -170,18 +168,17 @@ The `content` field contains the full result as JSON:
   "tags": [
     ["e", "<request_event_id>"],
     ["p", "<requester_pubkey>"],
-    ["status", "error", "Invalid 'from' pubkey format"]
+    ["status", "error", "Invalid pubkey format"]
   ],
-  "content": "{\"error\":\"Invalid 'from' pubkey format\"}",
+  "content": "{\"error\":\"Invalid pubkey format\"}",
   "id": "...",
   "sig": "..."
 }
 ```
 
 **Error Messages:**
-- `Missing required parameters: from and to pubkeys`
-- `Invalid 'from' pubkey format`
-- `Invalid 'to' pubkey format`
+- `Expected two 'i' tags with pubkeys or 'from'/'to' params`
+- `Invalid pubkey format`
 
 ---
 

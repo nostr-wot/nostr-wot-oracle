@@ -95,21 +95,26 @@ The default `docker-compose.yml`:
 version: '3.8'
 
 services:
-  wot-oracle:
+  nostr-wot-oracle:
     image: ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
     # Or build from source:
     # build: .
-    container_name: wot-oracle
+    container_name: nostr-wot-oracle
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-8080}:8080"
     volumes:
-      - wot-data:/app/data
+      - nostr-wot-data:/app/data
     environment:
-      - RELAYS=${RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band}
+      - RELAYS=${RELAYS:-wss://relay.mappingbitcoin.com,wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band}
       - HTTP_PORT=8080
       - DB_PATH=/app/data/wot.db
+      - DVM_ENABLED=${DVM_ENABLED:-false}
+      - DVM_PRIVATE_KEY=${DVM_PRIVATE_KEY:-}
       - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-100}
+      - MAX_HOPS=${MAX_HOPS:-3}
+      - CACHE_SIZE=${CACHE_SIZE:-10000}
+      - CACHE_TTL_SECS=${CACHE_TTL_SECS:-300}
       - RUST_LOG=${RUST_LOG:-info}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -119,7 +124,7 @@ services:
       start_period: 60s
 
 volumes:
-  wot-data:
+  nostr-wot-data:
 ```
 
 ## Production Deployment

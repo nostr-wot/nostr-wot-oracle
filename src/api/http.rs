@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -44,6 +44,14 @@ fn default_max_hops() -> u8 {
 #[derive(Debug, Deserialize)]
 pub struct FollowsQueryParams {
     pub pubkey: String,
+    #[serde(default = "default_follows_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_follows_limit() -> usize {
+    500
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +72,7 @@ pub struct PathQueryParams {
 pub struct FollowsResponse {
     pub pubkey: String,
     pub follows: Vec<String>,
+    pub total: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +139,11 @@ impl ErrorResponse {
 
 impl IntoResponse for ErrorResponse {
     fn into_response(self) -> axum::response::Response {
-        (StatusCode::BAD_REQUEST, Json(self)).into_response()
+        let status = match self.code.as_str() {
+            "INTERNAL_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, Json(self)).into_response()
     }
 }
 
@@ -143,7 +156,7 @@ fn validate_pubkey(pubkey: &str) -> Result<(), ErrorResponse> {
         });
     }
 
-    if !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !pubkey.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ErrorResponse {
             error: "Invalid pubkey format".to_string(),
             code: "INVALID_PUBKEY".to_string(),
@@ -199,13 +212,13 @@ pub async fn get_distance(
         bfs::compute_distance(&graph, &query)
     })
     .await
-    .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+    .map_err(|_| ErrorResponse::internal("Internal computation error"))?;
 
     // Cache insert (lock-free, back on async thread)
-    if let (Some(from_id), Some(to_id)) = (
-        state.graph.get_node_id(&params.from),
-        state.graph.get_node_id(&params.to),
-    ) {
+    // Re-lookup only if the first lookup was None (node may have been added during BFS)
+    let from_id = from_id.or_else(|| state.graph.get_node_id(&params.from));
+    let to_id = to_id.or_else(|| state.graph.get_node_id(&params.to));
+    if let (Some(from_id), Some(to_id)) = (from_id, to_id) {
         let cache_key = CacheKey::new(from_id, to_id, params.max_hops, params.include_bridges);
         state.cache.insert(cache_key, &result, &state.graph);
     }
@@ -288,7 +301,7 @@ pub async fn batch_distance(
                 .collect()
         })
         .await
-        .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+        .map_err(|_| ErrorResponse::internal("Internal computation error"))?;
 
         // Fill in computed results and cache them
         for (idx, result) in computed {
@@ -317,10 +330,16 @@ pub async fn get_follows(
     validate_pubkey(&params.pubkey)?;
 
     let follows = state.graph.get_follows(&params.pubkey).unwrap_or_default();
+    let total = follows.len();
+    let follows: Vec<String> = follows.into_iter()
+        .skip(params.offset)
+        .take(params.limit.min(5000))
+        .collect();
 
     Ok(Json(FollowsResponse {
         pubkey: params.pubkey,
         follows,
+        total,
     }))
 }
 
@@ -331,15 +350,18 @@ pub async fn get_common_follows(
     validate_pubkey(&params.from)?;
     validate_pubkey(&params.to)?;
 
-    let from_follows = state.graph.get_follows(&params.from).unwrap_or_default();
-    let to_follows = state.graph.get_follows(&params.to).unwrap_or_default();
+    let graph = state.graph.clone();
+    let from = params.from.clone();
+    let to = params.to.clone();
 
-    // Find intersection - both lists are from sorted internal storage
-    let from_set: std::collections::HashSet<_> = from_follows.into_iter().collect();
-    let common_follows: Vec<String> = to_follows
-        .into_iter()
-        .filter(|f| from_set.contains(f))
-        .collect();
+    let common_follows = tokio::task::spawn_blocking(move || {
+        let from_follows = graph.get_follows(&from).unwrap_or_default();
+        let to_follows = graph.get_follows(&to).unwrap_or_default();
+        let from_set: std::collections::HashSet<_> = from_follows.into_iter().collect();
+        to_follows.into_iter().filter(|f| from_set.contains(f)).collect::<Vec<String>>()
+    })
+    .await
+    .map_err(|_| ErrorResponse::internal("Internal computation error"))?;
 
     Ok(Json(CommonFollowsResponse {
         from: params.from,
@@ -367,7 +389,7 @@ pub async fn get_path(
         bfs::compute_path(&graph, &query)
     })
     .await
-    .map_err(|e| ErrorResponse::internal(e.to_string()))?;
+    .map_err(|_| ErrorResponse::internal("Internal computation error"))?;
 
     Ok(Json(PathResponse {
         from: params.from,
@@ -399,8 +421,8 @@ pub async fn health() -> Json<HealthResponse> {
 pub fn create_router(state: AppState, rate_limit_per_minute: u32) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE]);
 
     // Per-IP rate limiting with token bucket algorithm
     let per_second = std::cmp::max(1, rate_limit_per_minute / 60);
@@ -411,7 +433,7 @@ pub fn create_router(state: AppState, rate_limit_per_minute: u32) -> Router {
         .burst_size(burst_size)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
-        .unwrap();
+        .expect("Invalid rate limit configuration");
 
     info!(
         "Rate limiter: {} req/sec, burst size {}, body limit {}KB",
@@ -457,8 +479,8 @@ mod tests {
     fn create_test_router(state: AppState) -> Router {
         let cors = CorsLayer::new()
             .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE]);
 
         Router::new()
             .route("/health", get(health))

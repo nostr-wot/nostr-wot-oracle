@@ -478,12 +478,17 @@ Need events from user X
 The current `process_event` function in `src/sync/ingestion.rs` only extracts pubkeys from p-tags. To also extract relay hints:
 
 ```rust
-// Current: only extracts pubkey
+// Current: only extracts pubkey (with validation)
 let follows: Vec<String> = event.tags.iter()
     .filter_map(|tag| {
         let tag_vec = tag.as_slice();
         if tag_vec.len() >= 2 && tag_vec[0] == "p" {
-            Some(tag_vec[1].to_string())
+            let pk = &tag_vec[1];
+            if pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Some(pk.to_string())
+            } else {
+                None
+            }
         } else { None }
     }).collect();
 

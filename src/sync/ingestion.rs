@@ -175,7 +175,7 @@ fn process_event(event: &Event) -> Option<FollowUpdate> {
 
     let pubkey = event.pubkey.to_hex();
     let event_id = event.id.to_hex();
-    let created_at = event.created_at.as_u64() as i64;
+    let created_at = i64::try_from(event.created_at.as_u64()).unwrap_or(i64::MAX);
 
     // Parse p-tags to get follow list
     let follows: Vec<String> = event
@@ -186,7 +186,7 @@ fn process_event(event: &Event) -> Option<FollowUpdate> {
             if tag_vec.len() >= 2 && tag_vec[0] == "p" {
                 // Validate pubkey format (64 hex chars)
                 let pk = &tag_vec[1];
-                if pk.len() == 64 && pk.chars().all(|c| c.is_ascii_hexdigit()) {
+                if pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit()) {
                     Some(pk.to_string())
                 } else {
                     None
@@ -238,28 +238,31 @@ async fn persistence_worker(db: Arc<Database>, mut rx: mpsc::Receiver<FollowUpda
     }
 }
 
-async fn flush_batch(db: &Database, batch: &mut Vec<FollowUpdate>) {
+async fn flush_batch(db: &Arc<Database>, batch: &mut Vec<FollowUpdate>) {
     if batch.is_empty() {
         return;
     }
 
     debug!("Flushing {} updates to database", batch.len());
 
-    // Convert to batch format for single-transaction persistence
-    let updates: Vec<FollowUpdateBatch<'_>> = batch
-        .iter()
-        .map(|u| FollowUpdateBatch {
-            pubkey: &u.pubkey,
-            follows: &u.follows,
-            event_id: Some(&u.event_id),
-            created_at: Some(u.created_at),
-        })
-        .collect();
+    // Take ownership of batch items for the blocking task; drain() empties the batch
+    let owned_batch: Vec<FollowUpdate> = batch.drain(..).collect();
+    let db = db.clone();
 
-    match db.update_follows_batch(&updates) {
-        Ok(count) => debug!("Persisted {} updates in single transaction", count),
-        Err(e) => error!("Failed to persist follow batch: {}", e),
-    }
+    tokio::task::spawn_blocking(move || {
+        let updates: Vec<FollowUpdateBatch<'_>> = owned_batch
+            .iter()
+            .map(|u| FollowUpdateBatch {
+                pubkey: &u.pubkey,
+                follows: &u.follows,
+                event_id: Some(u.event_id.as_str()),
+                created_at: Some(u.created_at),
+            })
+            .collect();
 
-    batch.clear();
+        match db.update_follows_batch(&updates) {
+            Ok(count) => debug!("Persisted {} updates in single transaction", count),
+            Err(e) => error!("Failed to persist follow batch: {}", e),
+        }
+    }).await.ok();
 }

@@ -343,7 +343,7 @@ Example: 1M nodes, 10M edges ≈ 180MB
 | `HTTP_PORT` | 8080 | HTTP server port |
 | `DB_PATH` | wot.db | SQLite database path |
 | `RATE_LIMIT_PER_MINUTE` | 100 | Per-IP rate limit |
-| `MAX_HOPS` | 5 | Default max hops |
+| `MAX_HOPS` | 3 | Default max hops |
 | `CACHE_SIZE` | 10000 | LRU cache entries |
 | `CACHE_TTL_SECS` | 300 | Cache TTL (5 min) |
 | `DVM_ENABLED` | false | Enable NIP-90 DVM |
@@ -358,16 +358,16 @@ Example: 1M nodes, 10M edges ≈ 180MB
 
 - [x] In-memory graph with `Arc<str>` interning and sorted adjacency lists
 - [x] Bidirectional BFS with thread-local preallocated state
-- [x] Moka LRU cache with epoch-based invalidation
+- [x] Moka LRU cache with TTL-based expiration
 - [x] SQLite persistence with WAL mode and batch writes
 - [x] Multi-relay ingestion with LRU deduplication
-- [x] HTTP REST API: `/distance`, `/distance/batch`, `/stats`, `/health`
+- [x] HTTP REST API: `/distance`, `/distance/batch`, `/stats`, `/health`, `/follows`, `/common-follows`, `/path`
 - [x] Per-IP rate limiting via `tower_governor`
 - [x] `spawn_blocking` for CPU-bound BFS (async-friendly)
 - [x] DVM interface (kind 5950/6950)
 - [x] Docker deployment (multi-stage build)
 - [x] Graceful shutdown handling
-- [x] 36 passing tests
+- [x] Comprehensive test suite
 
 ### Performance Optimizations
 

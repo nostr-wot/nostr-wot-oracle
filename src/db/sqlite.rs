@@ -1,8 +1,9 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
-use tracing::{info, debug};
+use parking_lot::Mutex;
+use tracing::{info, debug, warn};
 
 use crate::graph::WotGraph;
 
@@ -31,7 +32,7 @@ impl Database {
         let conn = Connection::open(path)?;
 
         // Enable WAL mode for better concurrent access
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456;")?;
 
         let db = Self {
             conn: Mutex::new(conn),
@@ -43,7 +44,7 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         conn.execute_batch(r#"
             CREATE TABLE IF NOT EXISTS nodes (
@@ -79,7 +80,7 @@ impl Database {
     }
 
     pub fn load_graph(&self, graph: &WotGraph) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         // Load all nodes
         let mut node_stmt = conn.prepare(
@@ -95,7 +96,10 @@ impl Database {
                     row.get(3)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(val) => Some(val),
+                Err(e) => { warn!("Skipping malformed row: {}", e); None }
+            })
             .collect();
 
         info!("Loading {} nodes from database", nodes.len());
@@ -122,19 +126,25 @@ impl Database {
                     row.get::<_, String>(2)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(val) => Some(val),
+                Err(e) => { warn!("Skipping malformed row: {}", e); None }
+            })
+            .collect();
+
+        // Build a HashMap for O(1) lookup instead of O(N) linear scan per edge
+        let node_info_map: HashMap<&str, (&Option<String>, &Option<i64>)> = nodes.iter()
+            .map(|(_, pk, eid, cat)| (pk.as_str(), (eid, cat)))
             .collect();
 
         for (follower_pubkey, follows_csv) in edges {
             let follows: Vec<String> = follows_csv.split(',').map(|s| s.to_string()).collect();
             edge_count += follows.len();
 
-            // Find the node's event info
-            let node_info = nodes.iter()
-                .find(|(_, pk, _, _)| pk == &follower_pubkey);
-
-            let (event_id, created_at) = node_info
-                .map(|(_, _, eid, cat)| (eid.clone(), *cat))
+            // Look up the node's event info in O(1)
+            let (event_id, created_at) = node_info_map
+                .get(follower_pubkey.as_str())
+                .map(|(eid, cat)| ((*eid).clone(), **cat))
                 .unwrap_or((None, None));
 
             graph.update_follows(&follower_pubkey, &follows, event_id, created_at);
@@ -151,7 +161,7 @@ impl Database {
         kind3_event_id: Option<&str>,
         kind3_created_at: Option<i64>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
         conn.execute(
@@ -179,7 +189,7 @@ impl Database {
     pub fn update_follows(&self, follower_pubkey: &str, follows: &[String], event_id: Option<&str>, created_at: Option<i64>) -> Result<()> {
         if follows.is_empty() {
             // Just update the node, clear edges
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = self.conn.lock();
             let tx = conn.transaction()?;
             let now = chrono::Utc::now().timestamp();
 
@@ -206,7 +216,7 @@ impl Database {
             return Ok(());
         }
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
 
@@ -286,7 +296,7 @@ impl Database {
             return Ok(0);
         }
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
 
@@ -387,7 +397,7 @@ impl Database {
 
     #[allow(dead_code)] // Public API for sync state inspection
     pub fn get_sync_state(&self, relay_url: &str) -> Result<Option<SyncState>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         let result = conn.query_row(
             "SELECT relay_url, last_event_time, last_sync_at FROM sync_state WHERE relay_url = ?1",
@@ -410,7 +420,7 @@ impl Database {
 
     #[allow(dead_code)] // Public API for sync state management
     pub fn set_sync_state(&self, relay_url: &str, last_event_time: Option<i64>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
         conn.execute(
@@ -429,7 +439,7 @@ impl Database {
 
     #[allow(dead_code)] // Public API for database statistics
     pub fn get_stats(&self) -> Result<(usize, usize)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         let node_count: usize = conn.query_row(
             "SELECT COUNT(*) FROM nodes",
