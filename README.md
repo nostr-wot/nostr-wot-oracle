@@ -145,6 +145,10 @@ See [.env.example](.env.example) for all options.
 - **Latency:** Sub-millisecond for cached queries, <50ms for uncached
 - **Throughput:** 10,000+ queries/second on modern hardware
 
+## References
+
+[nostr-wot.com](https://nostr-wot.com)
+
 ## License
 
 MIT
