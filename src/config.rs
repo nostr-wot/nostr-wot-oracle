@@ -27,7 +27,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         let relays = env::var("RELAYS")
-            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band".into())
+            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/".into())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

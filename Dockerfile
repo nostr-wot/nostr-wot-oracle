@@ -1,5 +1,6 @@
 # Build stage
-FROM rust:1.85-slim-bookworm AS builder
+# Transitive crates (e.g. icu_*) require rustc ≥ 1.86; keep in sync with Cargo.lock / deps.
+FROM rust:1.86-slim-bookworm AS builder
 
 LABEL org.opencontainers.image.source="https://github.com/nostr-wot/nostr-wot-oracle"
 LABEL org.opencontainers.image.description="Pairwise distance queries for Nostr Web of Trust"
@@ -34,8 +35,9 @@ FROM debian:bookworm-slim
 WORKDIR /app
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder

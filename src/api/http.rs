@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+
+use super::governor_key::OracleSmartIpKeyExtractor;
 use tracing::{debug, info};
 
 use crate::cache::{CacheKey, CacheStats, QueryCache};
@@ -431,7 +433,7 @@ pub fn create_router(state: AppState, rate_limit_per_minute: u32) -> Router {
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(per_second as u64)
         .burst_size(burst_size)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(OracleSmartIpKeyExtractor)
         .finish()
         .expect("Invalid rate limit configuration");
 
@@ -475,7 +477,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// Test router without rate limiting (SmartIpKeyExtractor fails in tests)
+    /// Test router without rate limiting (governor needs `ConnectInfo` from `serve` in real runs)
     fn create_test_router(state: AppState) -> Router {
         let cors = CorsLayer::new()
             .allow_origin(Any)

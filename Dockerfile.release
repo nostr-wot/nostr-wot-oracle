@@ -1,0 +1,28 @@
+# Runtime image from a pre-built Linux ELF at target/release/wot-oracle (see docker-compose.release.yml).
+#
+# Not usable with Windows-only `cargo build --release` (that produces wot-oracle.exe). Use the
+# default docker-compose.yml (Dockerfile) instead, or build the Linux binary in WSL / cross-compile.
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/wot-oracle /app/wot-oracle
+
+RUN chmod +x /app/wot-oracle && mkdir -p /app/data
+
+ENV DB_PATH=/app/data/wot.db
+ENV HTTP_PORT=8080
+ENV RUST_LOG=info
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["/app/wot-oracle"]
