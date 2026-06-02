@@ -1,6 +1,6 @@
 [package]
 name = "wot-oracle"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Nostr Web of Trust Oracle - indexes follow graph and provides distance queries"
 license = "MIT"

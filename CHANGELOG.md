@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-06-02
+
+### Fixed
+- **HTTP API not responding** - axum rate limiter required `ConnectInfo<SocketAddr>` to extract the client IP; without it the middleware silently dropped every request (#2). The webserver now starts and serves traffic in Docker.
+- **Docker build broken** - Bumped builder image from `rust:1.85-slim-bookworm` to `rust:1.86-slim-bookworm`. Newer transitive deps (`icu_properties`, `idna_adapter`) require rustc 1.86.
+
 ## [0.2.1] - 2026-02-03
 
 ### Security
