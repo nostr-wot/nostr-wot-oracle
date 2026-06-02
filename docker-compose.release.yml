@@ -1,10 +1,18 @@
-version: '3.8'
+# Image from an existing Linux release binary at target/release/wot-oracle (no Rust compile in Docker).
+#
+# Windows: native `cargo build --release` produces wot-oracle.exe — that cannot be copied into
+# this Linux image. Build the ELF first, e.g. in WSL in this repo: `cargo build --release`, or
+# cross-compile: `cargo build --release --target x86_64-unknown-linux-gnu` and copy the artifact
+# to target/release/wot-oracle.
+#
+#   docker compose -f docker-compose.release.yml build
 
 services:
   nostr-wot-oracle:
-    image: ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-    # Or build from source:
-    # build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.release
+    image: nostr-wot-oracle:local
     container_name: nostr-wot-oracle
     restart: unless-stopped
     ports:

@@ -47,7 +47,7 @@ cargo build --release
 ./target/release/wot-oracle
 
 # Or with custom relays
-RELAYS=wss://relay.mappingbitcoin.com,wss://relay.damus.io,wss://nos.lol ./target/release/wot-oracle
+RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub ./target/release/wot-oracle
 ```
 
 ## API Usage

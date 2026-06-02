@@ -442,7 +442,7 @@ Need events from user X
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RELAYS` | `wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band` | Seed relays for initial connections |
+| `RELAYS` | `wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/` | Seed relays for initial connections |
 
 ### Proposed Additions
 

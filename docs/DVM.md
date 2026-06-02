@@ -249,7 +249,7 @@ The DVM connects to the relays specified in the `RELAYS` environment variable. F
 
 Example configuration:
 ```bash
-RELAYS=wss://relay.mappingbitcoin.com,wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
+RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/
 ```
 
 ---

@@ -29,7 +29,7 @@ docker run -d \
   --name wot-oracle \
   -p 8080:8080 \
   -v wot-data:/app/data \
-  -e RELAYS=wss://relay.mappingbitcoin.com,wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band \
+  -e RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/ \
   -e CACHE_SIZE=20000 \
   -e RUST_LOG=debug \
   ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
@@ -64,7 +64,7 @@ Edit `.env` or pass environment variables to docker-compose:
 
 ```bash
 # .env file
-RELAYS=wss://relay.mappingbitcoin.com,wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
+RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/
 HTTP_PORT=8080
 RATE_LIMIT_PER_MINUTE=100
 CACHE_SIZE=10000
@@ -106,7 +106,7 @@ services:
     volumes:
       - nostr-wot-data:/app/data
     environment:
-      - RELAYS=${RELAYS:-wss://relay.mappingbitcoin.com,wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band}
+      - RELAYS=${RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/}
       - HTTP_PORT=8080
       - DB_PATH=/app/data/wot.db
       - DVM_ENABLED=${DVM_ENABLED:-false}
