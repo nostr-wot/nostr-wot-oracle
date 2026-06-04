@@ -48,18 +48,16 @@ impl LockMetrics {
 
         LockMetricsSnapshot {
             write_lock_count: write_count,
-            write_lock_avg_us: if write_count > 0 {
-                (write_total_ns / write_count) / 1000
-            } else {
-                0
-            },
+            write_lock_avg_us: write_total_ns
+                .checked_div(write_count)
+                .map(|ns| ns / 1000)
+                .unwrap_or(0),
             write_lock_max_us: self.write_lock_max_ns.load(Ordering::Relaxed) / 1000,
             read_lock_count: read_count,
-            read_lock_avg_us: if read_count > 0 {
-                (read_total_ns / read_count) / 1000
-            } else {
-                0
-            },
+            read_lock_avg_us: read_total_ns
+                .checked_div(read_count)
+                .map(|ns| ns / 1000)
+                .unwrap_or(0),
             read_lock_max_us: self.read_lock_max_ns.load(Ordering::Relaxed) / 1000,
         }
     }

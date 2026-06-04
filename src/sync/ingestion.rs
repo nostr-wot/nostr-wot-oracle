@@ -245,8 +245,8 @@ async fn flush_batch(db: &Arc<Database>, batch: &mut Vec<FollowUpdate>) {
 
     debug!("Flushing {} updates to database", batch.len());
 
-    // Take ownership of batch items for the blocking task; drain() empties the batch
-    let owned_batch: Vec<FollowUpdate> = batch.drain(..).collect();
+    // Take ownership of batch items for the blocking task; mem::take leaves an empty Vec behind
+    let owned_batch: Vec<FollowUpdate> = std::mem::take(batch);
     let db = db.clone();
 
     tokio::task::spawn_blocking(move || {

@@ -246,7 +246,7 @@ fn bidirectional_bfs(
                     if let Some(&(bwd_d, bwd_paths)) = state.bwd_visited.get(&neighbor) {
                         let total_dist = fwd_dist + bwd_d;
 
-                        if best_distance.map_or(true, |best| total_dist < best) {
+                        if best_distance.is_none_or(|best| total_dist < best) {
                             best_distance = Some(total_dist);
                             state.meeting_nodes.clear();
                         }
@@ -295,7 +295,7 @@ fn bidirectional_bfs(
                     if let Some(&(fwd_d, fwd_paths)) = state.fwd_visited.get(&neighbor) {
                         let total_dist = fwd_d + bwd_dist;
 
-                        if best_distance.map_or(true, |best| total_dist < best) {
+                        if best_distance.is_none_or(|best| total_dist < best) {
                             best_distance = Some(total_dist);
                             state.meeting_nodes.clear();
                         }
