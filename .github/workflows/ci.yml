@@ -73,7 +73,11 @@ jobs:
           toolchain: "1.86"
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        # Prebuilt binary — building tarpaulin from source pulls deps that
+        # require rustc >= 1.91, which would break our 1.86 pin.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
