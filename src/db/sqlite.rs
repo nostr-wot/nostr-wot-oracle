@@ -664,6 +664,11 @@ mod tests {
     fn graph_load_reports_corrupt_edges_before_mutating_graph() {
         let db = Database::open(":memory:").unwrap();
         db.upsert_node("alice", None, None).unwrap();
+        // Simulate a legacy database written without foreign-key enforcement.
+        db.conn
+            .lock()
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
         db.conn
             .lock()
             .execute("INSERT INTO edges VALUES (1, 999)", [])

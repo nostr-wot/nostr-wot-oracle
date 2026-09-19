@@ -6,7 +6,7 @@ Newest `created_at` wins; equal timestamps select the lowest event ID. The graph
 
 Received events form bounded batches of up to 100, flushed once per second. SQLite writes coalesce each author's winning event and apply edge differences inside a transaction. The graph is updated only after persistence succeeds. A failed batch is retained for up to three attempts; persistent errors stop ingestion and cause the process to exit nonzero. Container supervision can then restart it from the database. Follow and mute batches are separate transactions; a crash between them is recovered by restoring committed state and relay replay.
 
-There is no separate lossy persistence queue. Slow database work can still overrun the SDK notification buffer. Such lag is counted, the current batch is flushed, and subscriptions are recreated to request relay history again. This is best-effort repair: coverage still depends on each relay's history retention and query limits.
+There is no separate lossy persistence queue. Slow database work can still overrun the SDK notification buffer. Such lag is counted, the current batch is flushed, and the SDK client, its event-ID deduplication state and subscriptions are recreated to request relay history again. This is best-effort repair: coverage still depends on each relay's history retention and query limits.
 
 On SIGTERM/SIGINT, ingestion stops accepting new events and flushes its received batch before exiting. HTTP shuts down gracefully. An abrupt kill or host failure can lose events not yet committed; replay depends on relay availability. The SQLite volume must be retained between releases.
 

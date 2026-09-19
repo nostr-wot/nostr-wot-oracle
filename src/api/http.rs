@@ -472,6 +472,15 @@ pub async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
     })
 }
 
+pub async fn service_info() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "service": "nostr-wot-oracle",
+        "version": env!("CARGO_PKG_VERSION"),
+        "documentation": "https://github.com/nostr-wot/nostr-wot-oracle/blob/main/docs/API.md",
+        "endpoints": ["/health", "/ready", "/stats", "/distance", "/distance/batch", "/path", "/follows", "/common-follows", "/mutes", "/trust"]
+    }))
+}
+
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "healthy".to_string(),
@@ -524,6 +533,7 @@ pub fn create_router(state: AppState, rate_limit_per_minute: u32) -> Router {
         })
         .merge(
             Router::new()
+                .route("/", get(service_info))
                 .route("/health", get(health))
                 .route("/ready", get(ready)),
         )
@@ -573,6 +583,7 @@ mod tests {
             .allow_headers([header::CONTENT_TYPE]);
 
         Router::new()
+            .route("/", get(service_info))
             .route("/health", get(health))
             .route("/ready", get(ready))
             .route("/mutes", get(get_mutes))
@@ -635,7 +646,9 @@ mod tests {
         let state = create_test_state();
         let from = "a".repeat(64);
         let to = "b".repeat(64);
-        state.graph.update_mutes(&from, &[to.clone()], None, None);
+        state
+            .graph
+            .update_mutes(&from, std::slice::from_ref(&to), None, None);
         let router = create_router(state.clone(), 6000);
         let (status, trust) =
             json_request(router.clone(), &format!("/trust?from={from}&to={to}")).await;
@@ -957,5 +970,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn root_identifies_service_and_documents_endpoints() {
+        let response = create_router(create_test_state(), 100)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 10240)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["service"], "nostr-wot-oracle");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
 }

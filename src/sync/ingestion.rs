@@ -114,17 +114,7 @@ impl Ingestion {
         if self.relays.is_empty() {
             return Err(anyhow!("at least one relay is required"));
         }
-        let client = Client::default();
-        for relay in &self.relays {
-            client
-                .add_relay(relay)
-                .await
-                .context("adding ingestion relay")?;
-        }
-        // Subscribe to notifications before requesting history, so the first events are retained.
-        let mut notifications = client.notifications();
-        client.connect().await;
-        client.subscribe(vec![list_filter()], None).await?;
+        let (mut client, mut notifications) = connect_list_client(&self.relays).await?;
         self.status.running.store(true, Ordering::Relaxed);
         info!(
             relays = self.relays.len(),
@@ -171,13 +161,12 @@ impl Ingestion {
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(count)) => {
                             self.status.lagged_notifications.fetch_add(count, Ordering::Relaxed);
-                            // Persist everything already received; then request history again to repair
-                            // the gap. Clear dedup so uncommitted/missed notifications cannot be hidden.
+                            // The SDK marks IDs seen before broadcasting notifications. Reusing its
+                            // client would suppress replay of events dropped from this receiver.
                             self.flush(&mut batch).await?;
                             seen.clear();
-                            warn!(count, "Relay notifications lagged; resubscribing for catch-up");
-                            client.unsubscribe_all().await;
-                            client.subscribe(vec![list_filter()], None).await?;
+                            warn!(count, "Relay notifications lagged; recreating client for catch-up");
+                            (client, notifications) = restart_list_client(&client, &self.relays).await?;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             self.flush(&mut batch).await?;
@@ -232,6 +221,33 @@ impl Ingestion {
         }
         unreachable!()
     }
+}
+
+async fn connect_list_client(
+    relays: &[String],
+) -> Result<(Client, broadcast::Receiver<RelayPoolNotification>)> {
+    let client = Client::default();
+    for relay in relays {
+        client
+            .add_relay(relay)
+            .await
+            .context("adding ingestion relay")?;
+    }
+    // Retain the first history events, and keep this receiver paired with this client's IDs.
+    let notifications = client.notifications();
+    client.connect().await;
+    client.subscribe(vec![list_filter()], None).await?;
+    Ok((client, notifications))
+}
+
+async fn restart_list_client(
+    previous: &Client,
+    relays: &[String],
+) -> Result<(Client, broadcast::Receiver<RelayPoolNotification>)> {
+    previous.disconnect().await?;
+    // A fresh default client owns a fresh in-memory SDK dedup database. The durable
+    // application database and graph are retained and reject stale replayed lists.
+    connect_list_client(relays).await
 }
 
 fn list_filter() -> Filter {
@@ -307,6 +323,19 @@ fn persist_and_apply(db: &Database, graph: &WotGraph, updates: &[ListUpdate]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn accept_relay_socket(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            // The SDK also requests a NIP-11 document over ordinary HTTP. Only
+            // upgraded WebSocket connections belong to the event test protocol.
+            if let Ok(ws) = tokio_tungstenite::accept_async(socket).await {
+                return ws;
+            }
+        }
+    }
 
     #[test]
     fn public_mute_lists_ignore_encrypted_content() {
@@ -391,6 +420,108 @@ mod tests {
         status.failed.store(true, Ordering::Relaxed);
         assert!(!status.ready());
     }
+
+    #[tokio::test]
+    async fn lag_recovery_replays_events_already_seen_by_sdk() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relays = vec![format!("ws://{}", listener.local_addr().unwrap())];
+        let keys = Keys::generate();
+        let target = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::ContactList, "", [Tag::public_key(target)])
+            .to_event(&keys)
+            .unwrap();
+        let expected_id = event.id;
+        let author = keys.public_key().to_hex();
+        let (send_history, history_requested) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(async move {
+            let mut history_requested = Some(history_requested);
+            let mut sockets = Vec::new();
+            for connection in 0..2 {
+                let mut ws = accept_relay_socket(&listener).await;
+                while let Some(Ok(message)) = ws.next().await {
+                    if let Message::Text(text) = message {
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if request[0] != "REQ" {
+                            continue;
+                        }
+                        if let Some(requested) = history_requested.take() {
+                            requested.await.unwrap();
+                        }
+                        let response = serde_json::json!(["EVENT", request[1], event]).to_string();
+                        // Only the first copy yields an SDK Event notification, but every
+                        // copy yields a Message. Overflow the default 4096-slot receiver
+                        // without generating thousands of expensive event signatures.
+                        let copies = if connection == 0 { 5000 } else { 1 };
+                        for _ in 0..copies {
+                            ws.send(Message::Text(response.clone())).await.unwrap();
+                        }
+                        ws.send(Message::Text(
+                            serde_json::json!(["EOSE", request[1]]).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                        break;
+                    }
+                }
+                // Keep the first connection open until the recovery code disconnects it.
+                sockets.push(ws);
+            }
+            std::future::pending::<()>().await;
+            drop(sockets);
+        });
+
+        let (client, mut stalled) = connect_list_client(&relays).await.unwrap();
+        let mut observer = client.notifications();
+        send_history.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match observer.recv().await {
+                    Ok(RelayPoolNotification::Message {
+                        message: RelayMessage::EndOfStoredEvents(_),
+                        ..
+                    }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(error) => panic!("relay closed before history completed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("relay history completed");
+        assert!(matches!(
+            stalled.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        assert_eq!(
+            client.database().check_id(&expected_id).await.unwrap(),
+            DatabaseEventStatus::Saved
+        );
+
+        let (recovered, mut notifications) = restart_list_client(&client, &relays).await.unwrap();
+        let replayed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let RelayPoolNotification::Event { event, .. } =
+                    notifications.recv().await.unwrap()
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("dropped event replayed despite old SDK dedup state");
+        assert_eq!(replayed.id, expected_id);
+        let db = Database::open(":memory:").unwrap();
+        let graph = WotGraph::new();
+        persist_and_apply(&db, &graph, &[process_event(&replayed).unwrap()]).unwrap();
+        let restored = WotGraph::new();
+        db.load_graph(&restored).unwrap();
+        assert_eq!(restored.get_follows(&author), Some(vec![target.to_hex()]));
+        recovered.disconnect().await.unwrap();
+        relay.abort();
+    }
+
     #[tokio::test]
     async fn local_relay_shutdown_drains_received_event() {
         use futures_util::{SinkExt, StreamExt};
@@ -405,8 +536,7 @@ mod tests {
             .unwrap();
         let author = keys.public_key().to_hex();
         let relay = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut ws = accept_relay_socket(&listener).await;
             while let Some(Ok(message)) = ws.next().await {
                 if let Message::Text(text) = message {
                     let request: serde_json::Value = serde_json::from_str(&text).unwrap();

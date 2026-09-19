@@ -301,8 +301,7 @@ mod tests {
         let to_id = node_ids[9];
 
         // Insert 10 entries
-        for i in 0..10 {
-            let from_id = node_ids[i];
+        for (i, &from_id) in node_ids.iter().enumerate() {
             let key = CacheKey::new(from_id, to_id, 5, false);
             let result = make_result(&format!("node{}", i), "node9", Some(i as u32));
             cache.insert(key, &result, &graph, graph.revision());
@@ -317,8 +316,8 @@ mod tests {
 
         // At least some entries should be present
         let mut found = 0;
-        for i in 0..10 {
-            let key = CacheKey::new(node_ids[i], to_id, 5, false);
+        for &from_id in &node_ids {
+            let key = CacheKey::new(from_id, to_id, 5, false);
             if cache.get(&key, &graph).is_some() {
                 found += 1;
             }

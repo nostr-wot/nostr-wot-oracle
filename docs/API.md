@@ -4,6 +4,7 @@ Version 0.3.0. Pubkeys use 64-character lowercase hexadecimal strings. Distance 
 
 | Endpoint | Parameters | Result |
 |---|---|---|
+| `GET /` | None | Service name, version, documentation and endpoint links |
 | `GET /health` | None | Process status and release version |
 | `GET /ready` | None | Ingestion snapshot; 200 when ready, 503 otherwise |
 | `GET /stats` | None | Node/follow/mute counts, cache, locks and sync status |
