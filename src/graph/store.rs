@@ -1,6 +1,10 @@
 use dashmap::DashMap;
-use parking_lot::RwLock;
-use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use super::interner::PubkeyInterner;
 use super::metrics::{LockMetrics, LockMetricsSnapshot, LockTimer};
@@ -18,9 +22,49 @@ pub struct GraphStats {
     pub node_count: usize,
     pub edge_count: usize,
     pub nodes_with_follows: usize,
+    pub mute_edge_count: usize,
+    pub nodes_with_mute_lists: usize,
+}
+
+/// Public kind:10000 evidence only; encrypted entries are not represented.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MuteEvidence {
+    pub source_mutes_target: bool,
+    pub target_mutes_source: bool,
+    pub followed_muters: Vec<Arc<str>>,
+    pub source_mute_list_known: bool,
+    pub target_mute_list_known: bool,
+}
+
+struct MuteList {
+    ids: Vec<u32>,
+    event_id: Option<String>,
+    created_at: Option<i64>,
+}
+
+fn accepts_event(
+    old_ts: Option<i64>,
+    old_id: &Option<String>,
+    new_ts: Option<i64>,
+    new_id: &Option<String>,
+) -> bool {
+    match (old_ts, new_ts) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(old), Some(new)) => {
+            new > old
+                || (new == old
+                    && new_id
+                        .as_ref()
+                        .is_some_and(|new| old_id.as_ref().is_none_or(|old| new < old)))
+        }
+    }
 }
 
 pub struct WotGraph {
+    // Writers serialize event ordering, adjacency diffs, and metadata publication.
+    mutation: Mutex<()>,
+    revision: AtomicU64,
     interner: PubkeyInterner,
     pubkey_to_id: DashMap<Arc<str>, u32>,
     id_to_pubkey: RwLock<Vec<Arc<str>>>,
@@ -28,18 +72,22 @@ pub struct WotGraph {
     follows: RwLock<Vec<Vec<u32>>>,
     followers: RwLock<Vec<Vec<u32>>>,
     node_info: RwLock<Vec<Option<NodeInfo>>>,
+    mutes: RwLock<FxHashMap<u32, MuteList>>,
     lock_metrics: LockMetrics,
 }
 
 impl WotGraph {
     pub fn new() -> Self {
         Self {
+            mutation: Mutex::new(()),
+            revision: AtomicU64::new(0),
             interner: PubkeyInterner::new(),
             pubkey_to_id: DashMap::new(),
             id_to_pubkey: RwLock::new(Vec::new()),
             follows: RwLock::new(Vec::new()),
             followers: RwLock::new(Vec::new()),
             node_info: RwLock::new(Vec::new()),
+            mutes: RwLock::new(FxHashMap::default()),
             lock_metrics: LockMetrics::new(),
         }
     }
@@ -50,9 +98,19 @@ impl WotGraph {
             return *id;
         }
 
-        let mut id_to_pubkey = self.id_to_pubkey.write();
+        let _mutation = self.mutation.lock();
+        self.get_or_create_node_locked(pubkey)
+    }
+
+    // Lock order throughout the graph: follows, followers, pubkeys, metadata, mutes.
+    // The caller holds mutation; readers never acquire mutation.
+    fn get_or_create_node_locked(&self, pubkey: &str) -> u32 {
+        if let Some(id) = self.pubkey_to_id.get(pubkey) {
+            return *id;
+        }
         let mut follows = self.follows.write();
         let mut followers = self.followers.write();
+        let mut id_to_pubkey = self.id_to_pubkey.write();
         let mut node_info = self.node_info.write();
 
         // Double-check after acquiring write lock
@@ -69,6 +127,7 @@ impl WotGraph {
         followers.push(Vec::new());
         node_info.push(None);
         self.pubkey_to_id.insert(interned, id);
+        self.revision.fetch_add(1, Ordering::Release);
 
         id
     }
@@ -104,16 +163,20 @@ impl WotGraph {
         event_id: Option<String>,
         created_at: Option<i64>,
     ) -> bool {
-        let node_id = self.get_or_create_node(pubkey);
+        let _mutation = self.mutation.lock();
+        let node_id = self.get_or_create_node_locked(pubkey);
 
         // Check if we should update (only if newer event)
         {
             let node_info = self.node_info.read();
             if let Some(Some(info)) = node_info.get(node_id as usize) {
-                if let (Some(existing_ts), Some(new_ts)) = (info.kind3_created_at, created_at) {
-                    if new_ts <= existing_ts {
-                        return false; // Event is older or same age, skip
-                    }
+                if !accepts_event(
+                    info.kind3_created_at,
+                    &info.kind3_event_id,
+                    created_at,
+                    &event_id,
+                ) {
+                    return false;
                 }
             }
         }
@@ -121,7 +184,7 @@ impl WotGraph {
         // Get or create IDs for all follows and sort them
         let mut new_follow_ids: Vec<u32> = follow_pubkeys
             .iter()
-            .map(|pk| self.get_or_create_node(pk))
+            .map(|pk| self.get_or_create_node_locked(pk))
             .collect();
         new_follow_ids.sort_unstable();
         new_follow_ids.dedup();
@@ -129,23 +192,32 @@ impl WotGraph {
         // Read old follows under read lock (quick clone)
         let old_follow_ids: Vec<u32> = {
             let follows = self.follows.read();
-            follows
-                .get(node_id as usize)
-                .cloned()
-                .unwrap_or_default()
+            follows.get(node_id as usize).cloned().unwrap_or_default()
         };
 
         // Compute diff OUTSIDE any lock - no contention during this work
-        let to_remove: Vec<u32> = old_follow_ids
-            .iter()
-            .filter(|id| new_follow_ids.binary_search(id).is_err())
-            .copied()
-            .collect();
-        let to_add: Vec<u32> = new_follow_ids
-            .iter()
-            .filter(|id| old_follow_ids.binary_search(id).is_err())
-            .copied()
-            .collect();
+        let mut to_remove = Vec::new();
+        let mut to_add = Vec::new();
+        let (mut old, mut new) = (0, 0);
+        while old < old_follow_ids.len() && new < new_follow_ids.len() {
+            match old_follow_ids[old].cmp(&new_follow_ids[new]) {
+                std::cmp::Ordering::Less => {
+                    to_remove.push(old_follow_ids[old]);
+                    old += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    to_add.push(new_follow_ids[new]);
+                    new += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    old += 1;
+                    new += 1;
+                }
+            }
+        }
+        to_remove.extend_from_slice(&old_follow_ids[old..]);
+        to_add.extend_from_slice(&new_follow_ids[new..]);
+        let edges_changed = !to_remove.is_empty() || !to_add.is_empty();
 
         // Minimal write lock - only actual mutations
         {
@@ -176,6 +248,9 @@ impl WotGraph {
                     }
                 }
             }
+            if edges_changed {
+                self.revision.fetch_add(1, Ordering::Release);
+            }
         }
 
         // Update node info (pubkey stored via interner, not duplicated here)
@@ -190,6 +265,145 @@ impl WotGraph {
         }
 
         true
+    }
+
+    /// Replace the public mute list independently of follow-list timestamps.
+    pub fn update_mutes(
+        &self,
+        pubkey: &str,
+        mute_pubkeys: &[String],
+        event_id: Option<String>,
+        created_at: Option<i64>,
+    ) -> bool {
+        let _mutation = self.mutation.lock();
+        let node_id = self.get_or_create_node_locked(pubkey);
+        {
+            let mutes = self.mutes.read();
+            if let Some(old) = mutes.get(&node_id) {
+                if !accepts_event(old.created_at, &old.event_id, created_at, &event_id) {
+                    return false;
+                }
+            }
+        }
+        let mut ids: Vec<u32> = mute_pubkeys
+            .iter()
+            .map(|pk| self.get_or_create_node_locked(pk))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut mutes = self.mutes.write();
+        mutes.insert(
+            node_id,
+            MuteList {
+                ids,
+                event_id,
+                created_at,
+            },
+        );
+        // Known empty lists and refreshed provenance are meaningful mute evidence too.
+        self.revision.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// None means no public mute list has been indexed, even for a known node.
+    pub fn get_mutes_page(
+        &self,
+        pubkey: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<String>, usize)> {
+        let node_id = self.get_node_id(pubkey)?;
+        let pubkeys = self.id_to_pubkey.read();
+        let mutes = self.mutes.read();
+        let list = mutes.get(&node_id)?;
+        let page = list
+            .ids
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|&id| pubkeys[id as usize].to_string())
+            .collect();
+        Some((page, list.ids.len()))
+    }
+
+    pub fn mute_evidence(&self, from: &str, to: &str) -> MuteEvidence {
+        let from = self.get_node_id(from);
+        let to = self.get_node_id(to);
+        let follows = self.follows.read();
+        let pubkeys = self.id_to_pubkey.read();
+        let mutes = self.mutes.read();
+        let has_edge = |source: Option<u32>, target: Option<u32>| match (
+            source.and_then(|id| mutes.get(&id)),
+            target,
+        ) {
+            (Some(list), Some(target)) => list.ids.binary_search(&target).is_ok(),
+            _ => false,
+        };
+        let followed_muters = from
+            .map(|from| {
+                follows[from as usize]
+                    .iter()
+                    .filter(|&&id| has_edge(Some(id), to))
+                    .map(|&id| pubkeys[id as usize].clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        MuteEvidence {
+            source_mutes_target: has_edge(from, to),
+            target_mutes_source: has_edge(to, from),
+            followed_muters,
+            source_mute_list_known: from.is_some_and(|id| mutes.contains_key(&id)),
+            target_mute_list_known: to.is_some_and(|id| mutes.contains_key(&id)),
+        }
+    }
+
+    /// Monotonic topology generation. Read before and after a computation before caching it.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Resolve only the requested slice, preserving the stable internal-ID order.
+    pub fn get_follows_page(
+        &self,
+        pubkey: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<String>, usize)> {
+        let node_id = self.get_node_id(pubkey)?;
+        let follows = self.follows.read();
+        let pubkeys = self.id_to_pubkey.read();
+        let ids = follows.get(node_id as usize)?;
+        let page = ids
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|&id| pubkeys[id as usize].to_string())
+            .collect();
+        Some((page, ids.len()))
+    }
+
+    /// Intersect sorted adjacency lists in linear time, resolving only matches.
+    pub fn common_follows(&self, from: &str, to: &str) -> Vec<String> {
+        let (Some(from), Some(to)) = (self.get_node_id(from), self.get_node_id(to)) else {
+            return Vec::new();
+        };
+        let follows = self.follows.read();
+        let pubkeys = self.id_to_pubkey.read();
+        let (a, b) = (&follows[from as usize], &follows[to as usize]);
+        let (mut i, mut j) = (0, 0);
+        let mut common = Vec::new();
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    common.push(pubkeys[a[i] as usize].to_string());
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        common
     }
 
     #[allow(dead_code)] // Public API for graph inspection
@@ -244,7 +458,9 @@ impl WotGraph {
     pub fn get_node_info(&self, pubkey: &str) -> Option<NodeInfo> {
         let node_id = self.get_node_id(pubkey)?;
         let node_info = self.node_info.read();
-        node_info.get(node_id as usize).and_then(|info| info.clone())
+        node_info
+            .get(node_id as usize)
+            .and_then(|info| info.clone())
     }
 
     pub fn stats(&self) -> GraphStats {
@@ -255,7 +471,10 @@ impl WotGraph {
         let edge_count: usize = follows.iter().map(|list| list.len()).sum();
         let nodes_with_follows = follows.iter().filter(|list| !list.is_empty()).count();
 
+        let mutes = self.mutes.read();
         GraphStats {
+            mute_edge_count: mutes.values().map(|list| list.ids.len()).sum(),
+            nodes_with_mute_lists: mutes.len(),
             node_count,
             edge_count,
             nodes_with_follows,
@@ -283,6 +502,182 @@ impl Default for WotGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mute_evidence_is_independent_and_versioned() {
+        let graph = WotGraph::new();
+        graph.update_follows(
+            "a",
+            &["b".into(), "c".into()],
+            Some("follow".into()),
+            Some(500),
+        );
+        let revision = graph.revision();
+        assert!(graph.update_mutes("a", &["target".into()], Some("ff".into()), Some(10)));
+        assert!(graph.revision() > revision);
+        assert!(graph.update_mutes(
+            "b",
+            &["target".into(), "target".into()],
+            Some("aa".into()),
+            Some(10)
+        ));
+        assert!(graph.update_mutes("target", &[], Some("aa".into()), Some(10)));
+        let evidence = graph.mute_evidence("a", "target");
+        assert!(evidence.source_mutes_target);
+        assert!(!evidence.target_mutes_source);
+        assert!(evidence.source_mute_list_known && evidence.target_mute_list_known);
+        assert_eq!(evidence.followed_muters, vec![Arc::<str>::from("b")]);
+        assert_eq!(
+            graph.get_mutes_page("b", 0, 10),
+            Some((vec!["target".into()], 1))
+        );
+        assert_eq!(graph.get_mutes_page("c", 0, 10), None);
+        assert_eq!(graph.get_mutes_page("target", 0, 10), Some((vec![], 0)));
+        assert!(!graph.update_mutes("a", &[], Some("ff".into()), Some(10)));
+        assert!(!graph.update_mutes("a", &[], Some("00".into()), Some(9)));
+        assert!(graph.update_mutes("a", &[], Some("00".into()), Some(10)));
+        assert!(!graph.mute_evidence("a", "target").source_mutes_target);
+        assert_eq!(graph.get_follows("a"), Some(vec!["b".into(), "c".into()]));
+        assert_eq!(graph.stats().mute_edge_count, 1);
+        assert_eq!(graph.stats().nodes_with_mute_lists, 3);
+        assert!(
+            !graph
+                .mute_evidence("missing", "absent")
+                .source_mute_list_known
+        );
+    }
+
+    #[test]
+    fn pages_intersections_and_revisions() {
+        let graph = WotGraph::new();
+        let initial = graph.revision();
+        graph.get_or_create_node("a");
+        assert!(graph.revision() > initial);
+        let before = graph.revision();
+        graph.get_or_create_node("a");
+        assert_eq!(graph.revision(), before);
+        graph.update_follows(
+            "a",
+            &["b".into(), "c".into(), "d".into()],
+            Some("1".into()),
+            Some(1),
+        );
+        let topology_revision = graph.revision();
+        assert!(topology_revision > before);
+        graph.update_follows(
+            "a",
+            &["b".into(), "c".into(), "d".into()],
+            Some("2".into()),
+            Some(2),
+        );
+        assert_eq!(graph.revision(), topology_revision);
+        assert_eq!(
+            graph.get_follows_page("a", 1, 1),
+            Some((vec!["c".into()], 3))
+        );
+        assert_eq!(
+            graph.get_follows_page("a", usize::MAX, 10),
+            Some((vec![], 3))
+        );
+        assert_eq!(graph.get_follows_page("missing", 0, 10), None);
+        graph.update_follows("b", &["c".into(), "d".into()], None, None);
+        assert_eq!(graph.common_follows("a", "b"), vec!["c", "d"]);
+        assert!(graph.common_follows("a", "missing").is_empty());
+        graph.update_follows("a", &[], Some("3".into()), Some(3));
+        assert!(graph.revision() > topology_revision);
+    }
+
+    #[test]
+    fn concurrent_readers_and_writers_preserve_topology() {
+        use std::{sync::mpsc, thread, time::Duration};
+        let graph = Arc::new(WotGraph::new());
+        graph.get_or_create_node("a");
+        let (done, results) = mpsc::channel();
+        let mut handles = Vec::new();
+        for worker in 0..6 {
+            let graph = graph.clone();
+            let done = done.clone();
+            handles.push(thread::spawn(move || {
+                for iteration in 0..100 {
+                    if worker < 3 {
+                        let ts = iteration * 3 + worker;
+                        graph.update_follows(
+                            "a",
+                            &[format!("n{ts}")],
+                            Some(format!("{ts:064x}")),
+                            Some(ts),
+                        );
+                        graph.update_mutes(
+                            "a",
+                            &[format!("m{ts}")],
+                            Some(format!("{ts:064x}")),
+                            Some(ts),
+                        );
+                    } else {
+                        graph.stats();
+                        graph.get_follows("a");
+                        graph.get_followers("a");
+                        graph.get_mutes_page("a", 0, 10);
+                        graph.mute_evidence("a", "n299");
+                        graph.with_adjacency(|follows, followers| {
+                            let ids: Vec<_> = (0..follows.len() as u32).collect();
+                            assert_eq!(graph.resolve_pubkeys_arc(&ids).len(), follows.len());
+                            for (a, outgoing) in follows.iter().enumerate() {
+                                for &b in outgoing {
+                                    assert!(followers[b as usize]
+                                        .binary_search(&(a as u32))
+                                        .is_ok());
+                                }
+                            }
+                            for (b, incoming) in followers.iter().enumerate() {
+                                for &a in incoming {
+                                    assert!(follows[a as usize].binary_search(&(b as u32)).is_ok());
+                                }
+                            }
+                        });
+                    }
+                }
+                done.send(()).unwrap();
+            }));
+        }
+        for _ in 0..6 {
+            results
+                .recv_timeout(Duration::from_secs(10))
+                .expect("graph operation stalled");
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(graph.get_follows("a"), Some(vec!["n299".into()]));
+        assert_eq!(
+            graph.get_mutes_page("a", 0, 10),
+            Some((vec!["m299".into()], 1))
+        );
+        assert_eq!(
+            graph.get_node_info("a").unwrap().kind3_created_at,
+            Some(299)
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_can_restore_missing_legacy_event_id() {
+        let graph = WotGraph::new();
+        graph.update_follows("a", &[], None, Some(100));
+        assert!(graph.update_follows("a", &["b".into()], Some("ff".into()), Some(100)));
+        assert!(!graph.update_follows("a", &[], None, Some(100)));
+        graph.update_mutes("a", &[], None, Some(100));
+        assert!(graph.update_mutes("a", &["b".into()], Some("ff".into()), Some(100)));
+        assert!(!graph.update_mutes("a", &[], None, Some(100)));
+    }
+
+    #[test]
+    fn equal_timestamp_uses_lowest_event_id() {
+        let graph = WotGraph::new();
+        assert!(graph.update_follows("a", &["b".into()], Some("ff".repeat(32)), Some(100)));
+        assert!(graph.update_follows("a", &["c".into()], Some("00".repeat(32)), Some(100)));
+        assert!(!graph.update_follows("a", &["d".into()], Some("ff".repeat(32)), Some(100)));
+        assert_eq!(graph.get_follows("a"), Some(vec!["c".into()]));
+    }
 
     #[test]
     fn test_create_nodes() {
@@ -350,7 +745,12 @@ mod tests {
     fn test_stats() {
         let graph = WotGraph::new();
 
-        graph.update_follows("alice", &["bob".to_string(), "carol".to_string()], None, None);
+        graph.update_follows(
+            "alice",
+            &["bob".to_string(), "carol".to_string()],
+            None,
+            None,
+        );
         graph.update_follows("bob", &["carol".to_string()], None, None);
 
         let stats = graph.stats();
@@ -366,7 +766,11 @@ mod tests {
         // Insert in random order
         graph.update_follows(
             "alice",
-            &["zebra".to_string(), "apple".to_string(), "mango".to_string()],
+            &[
+                "zebra".to_string(),
+                "apple".to_string(),
+                "mango".to_string(),
+            ],
             None,
             None,
         );
@@ -378,7 +782,10 @@ mod tests {
         graph.with_adjacency(|follows, _| {
             let follows_ids = &follows[alice_id as usize];
             for i in 1..follows_ids.len() {
-                assert!(follows_ids[i - 1] < follows_ids[i], "follows should be sorted");
+                assert!(
+                    follows_ids[i - 1] < follows_ids[i],
+                    "follows should be sorted"
+                );
             }
         });
     }

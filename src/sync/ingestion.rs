@@ -1,33 +1,90 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use lru::LruCache;
 use nostr_sdk::prelude::*;
+use serde::Serialize;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
+use tokio::sync::{broadcast, watch};
+use tracing::{info, warn};
 
 use crate::db::{Database, FollowUpdateBatch};
 use crate::graph::WotGraph;
 
 const SEEN_CACHE_CAPACITY: usize = 100_000;
+const BATCH_SIZE: usize = 100;
+const MUTE_KIND: u16 = 10000;
 
-/// Tracks the latest seen event for a pubkey (for deduplication)
+#[derive(Default)]
+pub struct SyncStatus {
+    running: AtomicBool,
+    failed: AtomicBool,
+    last_event_received_at: AtomicI64,
+    last_persisted_at: AtomicI64,
+    persisted_events: AtomicU64,
+    lagged_notifications: AtomicU64,
+    persistence_errors: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncSnapshot {
+    pub running: bool,
+    pub ready: bool,
+    pub last_event_received_at: i64,
+    pub last_persisted_at: i64,
+    pub persisted_events: u64,
+    pub lagged_notifications: u64,
+    pub persistence_errors: u64,
+    pub coverage: &'static str,
+}
+
+impl SyncStatus {
+    pub fn ready(&self) -> bool {
+        let last = self.last_event_received_at.load(Ordering::Relaxed);
+        self.running.load(Ordering::Relaxed)
+            && !self.failed.load(Ordering::Relaxed)
+            && last > 0
+            && chrono::Utc::now().timestamp().saturating_sub(last) <= 300
+    }
+
+    pub fn snapshot(&self) -> SyncSnapshot {
+        SyncSnapshot {
+            running: self.running.load(Ordering::Relaxed),
+            ready: self.ready(),
+            last_event_received_at: self.last_event_received_at.load(Ordering::Relaxed),
+            last_persisted_at: self.last_persisted_at.load(Ordering::Relaxed),
+            persisted_events: self.persisted_events.load(Ordering::Relaxed),
+            lagged_notifications: self.lagged_notifications.load(Ordering::Relaxed),
+            persistence_errors: self.persistence_errors.load(Ordering::Relaxed),
+            coverage: "configured_relays_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SeenEvent {
     created_at: u64,
-    #[allow(dead_code)]
     event_id: EventId,
+}
+
+impl SeenEvent {
+    fn dominates(&self, event: &Event) -> bool {
+        self.created_at > event.created_at.as_u64()
+            || (self.created_at == event.created_at.as_u64() && self.event_id <= event.id)
+    }
 }
 
 pub struct Ingestion {
     graph: Arc<WotGraph>,
     db: Arc<Database>,
     relays: Vec<String>,
+    pub status: Arc<SyncStatus>,
 }
 
-#[derive(Debug)]
-struct FollowUpdate {
+#[derive(Debug, Clone)]
+struct ListUpdate {
+    kind: u16,
     pubkey: String,
     follows: Vec<String>,
     event_id: String,
@@ -36,233 +93,488 @@ struct FollowUpdate {
 
 impl Ingestion {
     pub fn new(graph: Arc<WotGraph>, db: Arc<Database>, relays: Vec<String>) -> Self {
-        Self { graph, db, relays }
+        Self {
+            graph,
+            db,
+            relays,
+            status: Arc::new(SyncStatus::default()),
+        }
     }
 
-    pub async fn start(&self) -> Result<()> {
-        info!("Starting ingestion from {} relays", self.relays.len());
-
-        // Channel for database persistence
-        let (persist_tx, persist_rx) = mpsc::channel::<FollowUpdate>(10000);
-
-        // Start persistence worker
-        let db = self.db.clone();
-        tokio::spawn(async move {
-            persistence_worker(db, persist_rx).await;
-        });
-
-        // Create nostr client
-        let client = Client::default();
-
-        // Add relays
-        for relay_url in &self.relays {
-            match client.add_relay(relay_url).await {
-                Ok(_) => info!("Added relay: {}", relay_url),
-                Err(e) => warn!("Failed to add relay {}: {}", relay_url, e),
-            }
+    pub async fn start(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let result = self.run(&mut shutdown).await;
+        self.status.running.store(false, Ordering::Relaxed);
+        if result.is_err() {
+            self.status.failed.store(true, Ordering::Relaxed);
         }
+        result
+    }
 
-        // Connect to relays
-        client.connect().await;
+    async fn run(&self, shutdown: &mut watch::Receiver<bool>) -> Result<()> {
+        if self.relays.is_empty() {
+            return Err(anyhow!("at least one relay is required"));
+        }
+        let (mut client, mut notifications) = connect_list_client(&self.relays).await?;
+        self.status.running.store(true, Ordering::Relaxed);
+        info!(
+            relays = self.relays.len(),
+            "Ingesting public follow and mute lists"
+        );
 
-        // Subscribe to kind:3 (contact list) events
-        let filter = Filter::new().kind(Kind::ContactList);
-
-        info!("Subscribing to kind:3 events...");
-
-        let graph = self.graph.clone();
-        let persist_tx = persist_tx.clone();
-
-        // LRU cache for deduplication: pubkey bytes → latest seen event
-        // Evicts oldest entries when full, never clears entirely
-        let seen_events: Arc<tokio::sync::RwLock<LruCache<[u8; 32], SeenEvent>>> =
-            Arc::new(tokio::sync::RwLock::new(LruCache::new(
-                NonZeroUsize::new(SEEN_CACHE_CAPACITY).unwrap()
-            )));
-
-        // Handle events
-        client
-            .subscribe(vec![filter], None)
-            .await?;
-
-        // Process events
-        let mut notifications = client.notifications();
-        let mut event_count: u64 = 0;
-        let mut dedup_skip_count: u64 = 0;
-        let mut last_log_time = std::time::Instant::now();
+        let mut seen = LruCache::new(NonZeroUsize::new(SEEN_CACHE_CAPACITY).unwrap());
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut flush_timer = tokio::time::interval(Duration::from_secs(1));
+        flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
-                Ok(notification) = notifications.recv() => {
-                    if let RelayPoolNotification::Event { event, .. } = notification {
-                        let pubkey_bytes = event.pubkey.to_bytes();
-                        let event_created_at = event.created_at.as_u64();
-
-                        // Early dedup check BEFORE parsing tags
-                        // Skip if we've already seen a newer or equal event for this pubkey
-                        let dominated = {
-                            let seen = seen_events.read().await;
-                            if let Some(existing) = seen.peek(&pubkey_bytes) {
-                                event_created_at <= existing.created_at
-                            } else {
-                                false
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = flush_timer.tick() => {
+                    self.flush(&mut batch).await?;
+                }
+                notification = notifications.recv() => {
+                    match notification {
+                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                            let kind = event.kind.as_u16();
+                            if kind != 3 && kind != MUTE_KIND { continue; }
+                            let now = chrono::Utc::now().timestamp();
+                            // Avoid an author's far-future event suppressing their subsequent updates.
+                            if event.created_at.as_u64() > now as u64 + 600 { continue; }
+                            self.status.last_event_received_at.store(now, Ordering::Relaxed);
+                            let key = (event.pubkey.to_bytes(), kind);
+                            if seen.get(&key).is_some_and(|entry: &SeenEvent| entry.dominates(&event)) {
+                                continue;
                             }
-                        };
-                        if dominated {
-                            dedup_skip_count += 1;
-                            continue;
-                        }
-
-                        // Process the event (parse tags, extract follows)
-                        if let Some(update) = process_event(&event) {
-                            // Update in-memory graph (has its own timestamp check)
-                            let updated = graph.update_follows(
-                                &update.pubkey,
-                                &update.follows,
-                                Some(update.event_id.clone()),
-                                Some(update.created_at),
-                            );
-
-                            if updated {
-                                event_count += 1;
-
-                                // Update seen cache AFTER successful graph update
-                                {
-                                    let mut seen = seen_events.write().await;
-                                    seen.put(pubkey_bytes, SeenEvent {
-                                        created_at: event_created_at,
-                                        event_id: event.id,
-                                    });
-                                }
-
-                                // Send to persistence worker
-                                if let Err(e) = persist_tx.try_send(update) {
-                                    warn!("Persistence queue full: {}", e);
+                            if let Some(update) = process_event(&event) {
+                                seen.put(key, SeenEvent { created_at: event.created_at.as_u64(), event_id: event.id });
+                                batch.push(update);
+                                if batch.len() >= BATCH_SIZE {
+                                    self.flush(&mut batch).await?;
                                 }
                             }
                         }
-
-                        // Log progress periodically
-                        if last_log_time.elapsed() > Duration::from_secs(10) {
-                            let stats = graph.stats();
-                            let seen_size = seen_events.read().await.len();
-                            info!(
-                                "Sync progress: {} events, {} dedup skips, {} nodes, {} edges, seen_cache={}",
-                                event_count, dedup_skip_count, stats.node_count, stats.edge_count, seen_size
-                            );
-                            last_log_time = std::time::Instant::now();
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            self.status.lagged_notifications.fetch_add(count, Ordering::Relaxed);
+                            // The SDK marks IDs seen before broadcasting notifications. Reusing its
+                            // client would suppress replay of events dropped from this receiver.
+                            self.flush(&mut batch).await?;
+                            seen.clear();
+                            warn!(count, "Relay notifications lagged; recreating client for catch-up");
+                            (client, notifications) = restart_list_client(&client, &self.relays).await?;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.flush(&mut batch).await?;
+                            return Err(anyhow!("relay notification channel closed"));
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    // Periodic status log
-                    let stats = graph.stats();
-                    let seen_size = seen_events.read().await.len();
-                    info!(
-                        "Sync status: {} events, {} dedup skips, {} nodes, {} edges, seen_cache={}",
-                        event_count, dedup_skip_count, stats.node_count, stats.edge_count, seen_size
-                    );
+            }
+        }
+        // Container SIGTERM is handled by main, which waits for this durable drain.
+        self.flush(&mut batch).await?;
+        client.disconnect().await?;
+        Ok(())
+    }
+
+    async fn flush(&self, batch: &mut Vec<ListUpdate>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let updates = Arc::new(std::mem::take(batch));
+        for attempt in 0..3 {
+            let db = self.db.clone();
+            let graph = self.graph.clone();
+            let pending = updates.clone();
+            let result =
+                tokio::task::spawn_blocking(move || persist_and_apply(&db, &graph, &pending))
+                    .await
+                    .context("persistence task failed")?;
+            match result {
+                Ok(count) => {
+                    self.status
+                        .persisted_events
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    self.status
+                        .last_persisted_at
+                        .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+                    self.status.failed.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.status
+                        .persistence_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.status.failed.store(true, Ordering::Relaxed);
+                    if attempt == 2 {
+                        return Err(error.context("persisting received list updates"));
+                    }
+                    warn!(attempt, %error, "Persistence failed; retaining batch for retry");
+                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
                 }
             }
         }
+        unreachable!()
     }
 }
 
-fn process_event(event: &Event) -> Option<FollowUpdate> {
-    if event.kind != Kind::ContactList {
+async fn connect_list_client(
+    relays: &[String],
+) -> Result<(Client, broadcast::Receiver<RelayPoolNotification>)> {
+    let client = Client::default();
+    for relay in relays {
+        client
+            .add_relay(relay)
+            .await
+            .context("adding ingestion relay")?;
+    }
+    // Retain the first history events, and keep this receiver paired with this client's IDs.
+    let notifications = client.notifications();
+    client.connect().await;
+    client.subscribe(vec![list_filter()], None).await?;
+    Ok((client, notifications))
+}
+
+async fn restart_list_client(
+    previous: &Client,
+    relays: &[String],
+) -> Result<(Client, broadcast::Receiver<RelayPoolNotification>)> {
+    previous.disconnect().await?;
+    // A fresh default client owns a fresh in-memory SDK dedup database. The durable
+    // application database and graph are retained and reject stale replayed lists.
+    connect_list_client(relays).await
+}
+
+fn list_filter() -> Filter {
+    Filter::new().kinds([Kind::ContactList, Kind::Custom(MUTE_KIND)])
+}
+
+fn process_event(event: &Event) -> Option<ListUpdate> {
+    let kind = event.kind.as_u16();
+    if kind != 3 && kind != MUTE_KIND {
         return None;
     }
-
-    let pubkey = event.pubkey.to_hex();
-    let event_id = event.id.to_hex();
-    let created_at = i64::try_from(event.created_at.as_u64()).unwrap_or(i64::MAX);
-
-    // Parse p-tags to get follow list
-    let follows: Vec<String> = event
+    let mut follows: Vec<String> = event
         .tags
         .iter()
         .filter_map(|tag| {
-            let tag_vec = tag.as_slice();
-            if tag_vec.len() >= 2 && tag_vec[0] == "p" {
-                // Validate pubkey format (64 hex chars)
-                let pk = &tag_vec[1];
+            let values = tag.as_slice();
+            if values.len() >= 2 && values[0] == "p" {
+                let pk = &values[1];
                 if pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    Some(pk.to_string())
-                } else {
-                    None
+                    return Some(pk.to_ascii_lowercase());
                 }
-            } else {
-                None
             }
+            None
         })
         .collect();
-
-    debug!(
-        "Processed event from {} with {} follows",
-        &pubkey[..8],
-        follows.len()
-    );
-
-    Some(FollowUpdate {
-        pubkey,
+    follows.sort_unstable();
+    follows.dedup();
+    Some(ListUpdate {
+        kind,
+        pubkey: event.pubkey.to_hex(),
         follows,
-        event_id,
-        created_at,
+        event_id: event.id.to_hex(),
+        created_at: i64::try_from(event.created_at.as_u64()).unwrap_or(i64::MAX),
     })
 }
 
-async fn persistence_worker(db: Arc<Database>, mut rx: mpsc::Receiver<FollowUpdate>) {
-    info!("Persistence worker started");
-
-    let mut batch: Vec<FollowUpdate> = Vec::with_capacity(100);
-    let mut last_flush = std::time::Instant::now();
-
-    loop {
-        tokio::select! {
-            Some(update) = rx.recv() => {
-                batch.push(update);
-
-                // Flush batch when full or after timeout
-                if batch.len() >= 100 || last_flush.elapsed() > Duration::from_secs(5) {
-                    flush_batch(&db, &mut batch).await;
-                    last_flush = std::time::Instant::now();
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                if !batch.is_empty() {
-                    flush_batch(&db, &mut batch).await;
-                    last_flush = std::time::Instant::now();
-                }
-            }
-        }
-    }
-}
-
-async fn flush_batch(db: &Arc<Database>, batch: &mut Vec<FollowUpdate>) {
-    if batch.is_empty() {
-        return;
-    }
-
-    debug!("Flushing {} updates to database", batch.len());
-
-    // Take ownership of batch items for the blocking task; mem::take leaves an empty Vec behind
-    let owned_batch: Vec<FollowUpdate> = std::mem::take(batch);
-    let db = db.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let updates: Vec<FollowUpdateBatch<'_>> = owned_batch
+// Commit before publishing changes to readers. A database error leaves the graph untouched;
+// restart can reconstruct any committed batch even if the process exits while applying it.
+fn persist_and_apply(db: &Database, graph: &WotGraph, updates: &[ListUpdate]) -> Result<usize> {
+    let items = |kind| {
+        updates
             .iter()
+            .filter(|u| u.kind == kind)
             .map(|u| FollowUpdateBatch {
                 pubkey: &u.pubkey,
                 follows: &u.follows,
-                event_id: Some(u.event_id.as_str()),
+                event_id: Some(&u.event_id),
                 created_at: Some(u.created_at),
             })
-            .collect();
-
-        match db.update_follows_batch(&updates) {
-            Ok(count) => debug!("Persisted {} updates in single transaction", count),
-            Err(e) => error!("Failed to persist follow batch: {}", e),
+            .collect::<Vec<_>>()
+    };
+    let count = db.update_follows_batch(&items(3))? + db.update_mutes_batch(&items(MUTE_KIND))?;
+    for update in updates {
+        if update.kind == MUTE_KIND {
+            graph.update_mutes(
+                &update.pubkey,
+                &update.follows,
+                Some(update.event_id.clone()),
+                Some(update.created_at),
+            );
+        } else {
+            graph.update_follows(
+                &update.pubkey,
+                &update.follows,
+                Some(update.event_id.clone()),
+                Some(update.created_at),
+            );
         }
-    }).await.ok();
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn accept_relay_socket(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            // The SDK also requests a NIP-11 document over ordinary HTTP. Only
+            // upgraded WebSocket connections belong to the event test protocol.
+            if let Ok(ws) = tokio_tungstenite::accept_async(socket).await {
+                return ws;
+            }
+        }
+    }
+
+    #[test]
+    fn public_mute_lists_ignore_encrypted_content() {
+        let keys = Keys::generate();
+        let target = Keys::generate().public_key();
+        let event = EventBuilder::new(
+            Kind::Custom(MUTE_KIND),
+            "encrypted-private-items",
+            [Tag::public_key(target)],
+        )
+        .to_event(&keys)
+        .unwrap();
+        let update = process_event(&event).expect("public mute list");
+        assert_eq!(update.kind, MUTE_KIND);
+        assert_eq!(update.follows, vec![target.to_hex()]);
+    }
+
+    fn update(kind: u16, at: i64, follows: &[&str]) -> ListUpdate {
+        ListUpdate {
+            kind,
+            pubkey: "a".into(),
+            follows: follows.iter().map(|s| s.to_string()).collect(),
+            event_id: format!("{at:064x}"),
+            created_at: at,
+        }
+    }
+
+    #[test]
+    fn committed_follow_and_mute_updates_survive_restart() {
+        let db = Database::open(":memory:").unwrap();
+        let graph = WotGraph::new();
+        persist_and_apply(
+            &db,
+            &graph,
+            &[update(3, 20, &["b"]), update(MUTE_KIND, 10, &["b"])],
+        )
+        .unwrap();
+        let restored = WotGraph::new();
+        db.load_graph(&restored).unwrap();
+        assert_eq!(restored.get_follows("a"), Some(vec!["b".into()]));
+        assert!(restored.mute_evidence("a", "b").source_mutes_target);
+        persist_and_apply(&db, &graph, &[update(MUTE_KIND, 30, &[])]).unwrap();
+        assert!(!graph.mute_evidence("a", "b").source_mutes_target);
+    }
+
+    #[test]
+    fn database_failure_does_not_publish_graph_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wot.db");
+        let db = Database::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_write BEFORE INSERT ON nodes BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        let graph = WotGraph::new();
+        assert!(persist_and_apply(&db, &graph, &[update(3, 20, &["b"])]).is_err());
+        assert_eq!(graph.get_node_id("a"), None);
+        conn.execute_batch("DROP TRIGGER fail_write;").unwrap();
+        persist_and_apply(&db, &graph, &[update(3, 20, &["b"])]).unwrap();
+        assert_eq!(graph.get_follows("a"), Some(vec!["b".into()]));
+    }
+
+    #[tokio::test]
+    async fn small_batch_is_flushed_without_waiting_for_capacity() {
+        let db = Arc::new(Database::open(":memory:").unwrap());
+        let graph = Arc::new(WotGraph::new());
+        let ingestion = Ingestion::new(graph.clone(), db.clone(), vec![]);
+        let mut batch = vec![update(3, 20, &["b"])];
+        ingestion.flush(&mut batch).await.unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(graph.get_follows("a"), Some(vec!["b".into()]));
+        assert_eq!(ingestion.status.snapshot().persisted_events, 1);
+    }
+
+    #[test]
+    fn readiness_requires_recent_ingestion() {
+        let status = SyncStatus::default();
+        assert!(!status.ready());
+        status.running.store(true, Ordering::Relaxed);
+        status
+            .last_event_received_at
+            .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+        assert!(status.ready());
+        status.failed.store(true, Ordering::Relaxed);
+        assert!(!status.ready());
+    }
+
+    #[tokio::test]
+    async fn lag_recovery_replays_events_already_seen_by_sdk() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relays = vec![format!("ws://{}", listener.local_addr().unwrap())];
+        let keys = Keys::generate();
+        let target = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::ContactList, "", [Tag::public_key(target)])
+            .to_event(&keys)
+            .unwrap();
+        let expected_id = event.id;
+        let author = keys.public_key().to_hex();
+        let (send_history, history_requested) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(async move {
+            let mut history_requested = Some(history_requested);
+            let mut sockets = Vec::new();
+            for connection in 0..2 {
+                let mut ws = accept_relay_socket(&listener).await;
+                while let Some(Ok(message)) = ws.next().await {
+                    if let Message::Text(text) = message {
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if request[0] != "REQ" {
+                            continue;
+                        }
+                        if let Some(requested) = history_requested.take() {
+                            requested.await.unwrap();
+                        }
+                        let response = serde_json::json!(["EVENT", request[1], event]).to_string();
+                        // Only the first copy yields an SDK Event notification, but every
+                        // copy yields a Message. Overflow the default 4096-slot receiver
+                        // without generating thousands of expensive event signatures.
+                        let copies = if connection == 0 { 5000 } else { 1 };
+                        for _ in 0..copies {
+                            ws.send(Message::Text(response.clone())).await.unwrap();
+                        }
+                        ws.send(Message::Text(
+                            serde_json::json!(["EOSE", request[1]]).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                        break;
+                    }
+                }
+                // Keep the first connection open until the recovery code disconnects it.
+                sockets.push(ws);
+            }
+            std::future::pending::<()>().await;
+            drop(sockets);
+        });
+
+        let (client, mut stalled) = connect_list_client(&relays).await.unwrap();
+        let mut observer = client.notifications();
+        send_history.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match observer.recv().await {
+                    Ok(RelayPoolNotification::Message {
+                        message: RelayMessage::EndOfStoredEvents(_),
+                        ..
+                    }) => break,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(error) => panic!("relay closed before history completed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("relay history completed");
+        assert!(matches!(
+            stalled.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        assert_eq!(
+            client.database().check_id(&expected_id).await.unwrap(),
+            DatabaseEventStatus::Saved
+        );
+
+        let (recovered, mut notifications) = restart_list_client(&client, &relays).await.unwrap();
+        let replayed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let RelayPoolNotification::Event { event, .. } =
+                    notifications.recv().await.unwrap()
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("dropped event replayed despite old SDK dedup state");
+        assert_eq!(replayed.id, expected_id);
+        let db = Database::open(":memory:").unwrap();
+        let graph = WotGraph::new();
+        persist_and_apply(&db, &graph, &[process_event(&replayed).unwrap()]).unwrap();
+        let restored = WotGraph::new();
+        db.load_graph(&restored).unwrap();
+        assert_eq!(restored.get_follows(&author), Some(vec![target.to_hex()]));
+        recovered.disconnect().await.unwrap();
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn local_relay_shutdown_drains_received_event() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let keys = Keys::generate();
+        let target = Keys::generate().public_key();
+        let event = EventBuilder::new(Kind::ContactList, "", [Tag::public_key(target)])
+            .to_event(&keys)
+            .unwrap();
+        let author = keys.public_key().to_hex();
+        let relay = tokio::spawn(async move {
+            let mut ws = accept_relay_socket(&listener).await;
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if request[0] == "REQ" {
+                        let response = serde_json::json!(["EVENT", request[1], event]);
+                        ws.send(Message::Text(response.to_string())).await.unwrap();
+                        ws.send(Message::Text(
+                            serde_json::json!(["EOSE", request[1]]).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+        });
+        let db = Arc::new(Database::open(":memory:").unwrap());
+        let graph = Arc::new(WotGraph::new());
+        let ingestion = Ingestion::new(graph.clone(), db.clone(), vec![format!("ws://{address}")]);
+        let status = ingestion.status.clone();
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(async move { ingestion.start(stopped).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while status.last_event_received_at.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("local relay event received");
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let restored = WotGraph::new();
+        db.load_graph(&restored).unwrap();
+        assert_eq!(restored.get_follows(&author), Some(vec![target.to_hex()]));
+        assert!(!status.snapshot().running);
+        relay.abort();
+    }
 }

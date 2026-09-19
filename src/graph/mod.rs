@@ -1,7 +1,7 @@
-pub mod store;
 pub mod bfs;
-pub mod metrics;
 pub mod interner;
+pub mod metrics;
+pub mod store;
 
-pub use store::WotGraph;
 pub use metrics::LockMetricsSnapshot;
+pub use store::WotGraph;

@@ -1,154 +1,54 @@
-# WoT Oracle
+# Nostr WoT Oracle
 
-[![Build](https://github.com/nostr-wot/nostr-wot-oracle/actions/workflows/ci.yml/badge.svg?job=build)](https://github.com/nostr-wot/nostr-wot-oracle/actions/workflows/ci.yml)
-[![Tests](https://github.com/nostr-wot/nostr-wot-oracle/actions/workflows/ci.yml/badge.svg?job=test)](https://github.com/nostr-wot/nostr-wot-oracle/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/nostr-wot/nostr-wot-oracle/branch/main/graph/badge.svg)](https://codecov.io/gh/nostr-wot/nostr-wot-oracle)
+A Rust service that indexes public Nostr follow and mute lists. Query directed follow distance, shortest-path counts, mutual follows, and public mute evidence between pubkeys.
 
-A high-performance Nostr Web of Trust oracle that indexes the global follow graph and provides pairwise distance queries between pubkeys.
+**Distance is a follow-graph measurement, not a combined trust score.** Mutes are separate signals. Only public kind-10000 `p` tags are visible; encrypted entries are not available to the oracle. Coverage is limited to events returned by the configured relays, so a missing path or mute list does not establish absence across Nostr.
 
-## What It Does
+## Run
 
-WoT Oracle continuously syncs follow lists (kind:3 events) from Nostr relays and builds an in-memory graph. You can then query the "social distance" between any two pubkeys - how many hops through the follow graph connect them. It also caches kind:0 profile metadata (name, picture, NIP-05, etc.) and can return cached profiles alongside distance queries via the `include_profiles` parameter or the dedicated `/profiles` endpoint.
-
-**Example:** If Alice follows Bob, and Bob follows Carol, then the distance from Alice to Carol is 2 hops.
-
-## Quick Start
-
-### Using Pre-built Docker Image (Recommended)
-
-```bash
-# Pull and run
-docker pull ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-docker run -d -p 8080:8080 -v wot-data:/app/data ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-
-# Check health
-curl http://localhost:8080/health
+```sh
+docker compose up -d
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
+curl http://127.0.0.1:8080/stats
 ```
 
-### Using Docker Compose
+Compose uses `ghcr.io/nostr-wot/nostr-wot-oracle:0.3.0`, stores SQLite in a named volume, and binds to localhost. Use an HTTPS reverse proxy for public access. Set `BIND_ADDRESS=0.0.0.0` only when direct network exposure is intended.
 
-```bash
-# Clone and start
-git clone https://github.com/nostr-wot/nostr-wot-oracle.git
-cd nostr-wot-oracle
-docker-compose up -d
+From source, use Rust 1.93.0 or newer:
 
-# Check health
-curl http://localhost:8080/health
-```
-
-### Building from Source
-
-```bash
-# Requires Rust 1.75+
-cargo build --release
-
-# Run with default settings
+```sh
+cargo test --locked
+cargo build --locked --release
 ./target/release/wot-oracle
-
-# Or with custom relays
-RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub ./target/release/wot-oracle
 ```
 
-## API Usage
+## API
 
-### Get Distance Between Two Pubkeys
+Replace `FROM` and `TO` with 64-character lowercase hexadecimal public keys.
 
-```bash
-curl "http://localhost:8080/distance?from=PUBKEY1&to=PUBKEY2"
+```sh
+curl 'http://127.0.0.1:8080/distance?from=FROM&to=TO&include_bridges=true'
+curl 'http://127.0.0.1:8080/path?from=FROM&to=TO'
+curl 'http://127.0.0.1:8080/follows?pubkey=FROM&offset=0&limit=500'
+curl 'http://127.0.0.1:8080/mutes?pubkey=FROM'
+curl 'http://127.0.0.1:8080/trust?from=FROM&to=TO'
 ```
 
-Response:
-```json
-{
-  "from": "abc123...",
-  "to": "def456...",
-  "hops": 2,
-  "path_count": 3,
-  "mutual_follow": false,
-  "bridges": ["bridge1...", "bridge2..."]
-}
-```
+`/trust` returns `follow_distance` and `public_mute_evidence`, including direct mute flags, followed accounts publicly muting the target, and whether each side's public mute list is known. It does not change graph traversal or calculate a numeric score.
 
-Include cached profile metadata in the response:
+`POST /distance/batch` accepts `from`, up to 100 `targets`, and optional `max_hops`, `include_bridges`, `bypass_cache`. Duplicate targets retain their positions but are calculated once per request. `/common-follows` returns the intersection of two follow lists.
 
-```bash
-curl "http://localhost:8080/distance?from=PUBKEY1&to=PUBKEY2&include_profiles=true"
-```
+`/health` reports process liveness; `/ready` requires running ingestion, no current persistence failure and a recently received list event. Neither promises a complete global graph. `/stats` includes graph size, public mute counts, cache/lock metrics and ingestion status.
 
-### Batch Query
+## Operation
 
-```bash
-curl -X POST http://localhost:8080/distance/batch \
-  -H "Content-Type: application/json" \
-  -d '{"from": "PUBKEY1", "targets": ["PUBKEY2", "PUBKEY3"]}'
-```
+- Follow and mute lists have independent event versions: newest timestamp wins, lowest event ID breaks ties.
+- Batches commit to SQLite before becoming visible in memory. Failed batches retry, then terminate ingestion so the supervisor can restart and recover from persisted state.
+- SIGTERM/SIGINT drains the pending batch and shuts down HTTP gracefully. Allow at least 60 seconds before force-stopping a container.
+- Cache entries are tied to graph revisions. Four concurrent expensive queries are allowed across HTTP and DVM.
+- Profiles, `/profiles`, NIP-65 relay discovery and comprehensive historical crawling are not implemented.
 
-### Get Follows
+See [.env.example](.env.example), [API reference](docs/API.md), [self-hosting](docs/SELF-HOST.md), [sync behavior](docs/SYNC.md), [architecture](docs/ARCHITECTURE.md) and [changelog](CHANGELOG.md).
 
-```bash
-curl "http://localhost:8080/follows?pubkey=PUBKEY"
-```
-
-### Get Common Follows
-
-```bash
-curl "http://localhost:8080/common-follows?from=PUBKEY1&to=PUBKEY2"
-```
-
-### Get Shortest Path
-
-```bash
-curl "http://localhost:8080/path?from=PUBKEY1&to=PUBKEY2"
-```
-
-### Get Profiles
-
-```bash
-curl "http://localhost:8080/profiles?pubkeys=PUBKEY1,PUBKEY2"
-```
-
-### Graph Stats
-
-```bash
-curl http://localhost:8080/stats
-```
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RELAYS` | damus, nos.lol, nostr.band | Comma-separated relay URLs |
-| `HTTP_PORT` | 8080 | HTTP server port |
-| `DB_PATH` | wot.db | SQLite database path |
-| `RATE_LIMIT_PER_MINUTE` | 100 | Per-IP rate limit |
-| `MAX_HOPS` | 3 | Default max hops for distance queries (1-5) |
-| `CACHE_SIZE` | 10000 | LRU cache entries |
-| `CACHE_TTL_SECS` | 300 | Cache TTL (5 min) |
-| `PROFILE_CACHE_SIZE` | 50000 | Profile cache LRU entries |
-| `PROFILE_CACHE_TTL_SECS` | 3600 | Profile cache TTL (1 hour) |
-
-See [.env.example](.env.example) for all options.
-
-## Documentation
-
-- [API Reference](docs/API.md) - Full REST API documentation
-- [DVM Interface](docs/DVM.md) - NIP-90 Nostr integration
-- [Self-Hosting Guide](docs/SELF-HOST.md) - Docker deployment guide
-- [Architecture](docs/ARCHITECTURE.md) - How it works internally
-- [Sync & Relay Discovery](docs/SYNC.md) - Sync process and relay discovery strategy
-
-## Performance
-
-- **BFS Algorithm:** Bidirectional breadth-first search with O(b^(d/2)) complexity
-- **Memory:** ~100 bytes per node, ~8 bytes per edge
-- **Latency:** Sub-millisecond for cached queries, <50ms for uncached
-- **Throughput:** 10,000+ queries/second on modern hardware
-
-## References
-
-[nostr-wot.com](https://nostr-wot.com)
-
-## License
-
-MIT
+MIT license.

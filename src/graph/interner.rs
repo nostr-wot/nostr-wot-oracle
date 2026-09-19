@@ -27,9 +27,7 @@ impl PubkeyInterner {
         let arc: Arc<str> = Arc::from(s);
 
         // Use entry API to handle race condition
-        self.interned
-            .entry(arc.clone())
-            .or_insert(());
+        self.interned.entry(arc.clone()).or_insert(());
 
         // Return the arc we created (or the one that won the race)
         if let Some(entry) = self.interned.get(s) {

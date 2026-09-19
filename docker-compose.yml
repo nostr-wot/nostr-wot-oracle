@@ -1,14 +1,13 @@
-version: '3.8'
-
 services:
   nostr-wot-oracle:
-    image: ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
+    image: ghcr.io/nostr-wot/nostr-wot-oracle:0.3.0
     # Or build from source:
     # build: .
     container_name: nostr-wot-oracle
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
-      - "${HTTP_PORT:-8080}:8080"
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
     volumes:
       - nostr-wot-data:/app/data
     environment:

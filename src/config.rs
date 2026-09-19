@@ -27,7 +27,10 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         let relays = env::var("RELAYS")
-            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/".into())
+            .unwrap_or_else(|_| {
+                "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/"
+                    .into()
+            })
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -95,7 +98,10 @@ impl std::fmt::Debug for Config {
             .field("http_port", &self.http_port)
             .field("db_path", &self.db_path)
             .field("dvm_enabled", &self.dvm_enabled)
-            .field("dvm_private_key", &self.dvm_private_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "dvm_private_key",
+                &self.dvm_private_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)
             .field("max_hops", &self.max_hops)
             .field("cache_size", &self.cache_size)
