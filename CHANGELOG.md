@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-19
+
+### Added
+- Public kind-10000 mute-list ingestion and independent persistence, including empty lists and unmute updates.
+- `GET /mutes` for paginated public mute lists; `GET /trust` for follow distance plus explicit public mute evidence. No combined trust score is calculated and encrypted mute entries remain unavailable.
+- `GET /ready` and ingestion status in `/stats`, distinguishing live ingestion from process liveness and reporting configured-relay-only coverage.
+- Regression tests for query correctness, concurrent graph access, event ordering, restart recovery, database rollback, cache freshness and mute evidence.
+
+### Fixed
+- Graph lock ordering that could deadlock reads against new-node ingestion.
+- Shortest-path counts changing with `include_bridges`; path results exceeding `max_hops` or including the destination among intermediate nodes.
+- Replaceable-event ties now select the lowest event ID consistently in ingestion, graph and database.
+- Empty follow lists retain their event provenance across restarts, preventing stale follows from reappearing.
+- Database failures no longer publish unpersisted graph changes; bounded retry, explicit failure propagation and SIGTERM/SIGINT draining replace a lossy persistence queue.
+- Cached results are bound to the graph revision and cannot survive relationship changes or be populated by a late computation from an older graph.
+- Correct token-bucket replenishment for configured requests per minute.
+
+### Changed
+- SQLite batches coalesce author updates and persist edge differences instead of rewriting every follow.
+- Startup reads numeric edges rather than concatenated pubkey strings.
+- Follow pagination resolves only the requested slice; common follows uses sorted-ID intersection; batch distance requests deduplicate repeated targets.
+- HTTP and DVM computations share bounded concurrency.
+- Rust 1.93.0 and committed Cargo.lock make CI and Docker dependency resolution reproducible; release images are tested before publication.
+- Compose binds to localhost by default for use behind a reverse proxy.
+- Documentation now describes implemented APIs and explicitly states graph coverage and private-mute limitations.
+
 ## [0.2.2] - 2026-06-02
 
 ### Fixed

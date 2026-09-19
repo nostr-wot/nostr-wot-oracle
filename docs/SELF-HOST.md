@@ -1,290 +1,62 @@
-# Self-Hosting Guide
+# Self-hosting WoT Oracle
 
-This guide covers deploying WoT Oracle using Docker.
+Use the release image `ghcr.io/nostr-wot/nostr-wot-oracle:0.3.0` on Linux amd64 or arm64. Building from source requires Rust 1.93.0 or newer and the committed Cargo.lock.
 
-## Requirements
+## Compose
 
-- Docker 20.10+
-- Docker Compose 2.0+
-- 1GB RAM minimum (2GB+ recommended for large graphs)
-- Persistent storage for SQLite database
-
-## Quick Start
-
-### Option 1: Pre-built Image (Recommended)
-
-```bash
-# Pull from GitHub Container Registry
-docker pull ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-
-# Run with default settings
-docker run -d \
-  --name wot-oracle \
-  -p 8080:8080 \
-  -v wot-data:/app/data \
-  ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-
-# Run with custom configuration
-docker run -d \
-  --name wot-oracle \
-  -p 8080:8080 \
-  -v wot-data:/app/data \
-  -e RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/ \
-  -e CACHE_SIZE=20000 \
-  -e RUST_LOG=debug \
-  ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-
-# Verify it's running
-curl http://localhost:8080/health
-```
-
-### Option 2: Docker Compose
-
-```bash
-# Clone the repository
+```sh
 git clone https://github.com/nostr-wot/nostr-wot-oracle.git
 cd nostr-wot-oracle
-
-# Copy example environment file
+git checkout v0.3.0
 cp .env.example .env
-
-# Start the service
-docker-compose up -d
-
-# Check logs
-docker-compose logs -f
-
-# Verify it's running
-curl http://localhost:8080/health
+docker compose up -d
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
 ```
+
+Keep the named data volume. `docker compose down -v` destroys the indexed state. The schema upgrade adds mute tables while retaining existing follow data. Back up the database before upgrading; use SQLite's backup command for a live database, or stop the container before copying database/WAL files together.
+
+Compose binds localhost by default. `HTTP_PORT` selects the host port; the container always listens on 8080. Use `BIND_ADDRESS=0.0.0.0` only for intentionally public direct access. The process itself binds all interfaces inside the container.
+
+The source Dockerfile builds with Rust 1.93.0 and locked dependencies. `Dockerfile.release` accepts a prebuilt Linux binary; a macOS or Windows executable will not work in that image.
 
 ## Configuration
 
-Edit `.env` or pass environment variables to docker-compose:
+| Variable | Default | Purpose |
+|---|---|---|
+| `RELAYS` | damus.io, nos.lol, relay.primal.net, relay.mostr.pub | Comma-separated websocket relay URLs |
+| `HTTP_PORT` | 8080 | HTTP listen port (host mapping with Compose) |
+| `DB_PATH` | wot.db; /app/data/wot.db in Docker | SQLite path |
+| `DVM_ENABLED` | false | Enable NIP-90 requests |
+| `DVM_PRIVATE_KEY` | unset | Required for DVM; hex or nsec |
+| `RATE_LIMIT_PER_MINUTE` | 100 | Per-IP token refill, bounded 1–1000 |
+| `MAX_HOPS` | 3 | DVM default; HTTP default is 3, explicit limit 1–5 |
+| `CACHE_SIZE` | 10000 | Bounded 100–100000 entries |
+| `CACHE_TTL_SECS` | 300 | Maximum age, bounded 10–3600 seconds; graph revisions invalidate sooner |
+| `RUST_LOG` | info | Logging verbosity |
 
-```bash
-# .env file
-RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/
-HTTP_PORT=8080
-RATE_LIMIT_PER_MINUTE=100
-CACHE_SIZE=10000
-CACHE_TTL_SECS=300
-RUST_LOG=info
-```
+Allow 60 seconds for graceful stopping. SIGTERM/SIGINT drains received batches before exit. Persistent database failure exits nonzero; `restart: unless-stopped` recovers the service. Size memory limits according to measured graph size and ingestion. No universal production throughput or memory guarantee is made.
 
-### Environment Variables
+## HTTPS reverse proxy
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RELAYS` | damus, nos.lol, nostr.band | Comma-separated Nostr relay WebSocket URLs |
-| `HTTP_PORT` | 8080 | Port to expose the HTTP API |
-| `DB_PATH` | /app/data/wot.db | SQLite database path (inside container) |
-| `RATE_LIMIT_PER_MINUTE` | 100 | Max requests per IP per minute |
-| `CACHE_SIZE` | 10000 | Number of query results to cache |
-| `CACHE_TTL_SECS` | 300 | Cache entry lifetime in seconds |
-| `MAX_HOPS` | 5 | Default max hops for queries |
-| `DVM_ENABLED` | false | Enable NIP-90 DVM interface |
-| `DVM_PRIVATE_KEY` | - | DVM signing key (nsec or hex) |
-| `RUST_LOG` | info | Log level (trace/debug/info/warn/error) |
-
-## Docker Compose
-
-The default `docker-compose.yml`:
-
-```yaml
-version: '3.8'
-
-services:
-  nostr-wot-oracle:
-    image: ghcr.io/nostr-wot/nostr-wot-oracle:0.2.1
-    # Or build from source:
-    # build: .
-    container_name: nostr-wot-oracle
-    restart: unless-stopped
-    ports:
-      - "${HTTP_PORT:-8080}:8080"
-    volumes:
-      - nostr-wot-data:/app/data
-    environment:
-      - RELAYS=${RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net/,wss://relay.mostr.pub/}
-      - HTTP_PORT=8080
-      - DB_PATH=/app/data/wot.db
-      - DVM_ENABLED=${DVM_ENABLED:-false}
-      - DVM_PRIVATE_KEY=${DVM_PRIVATE_KEY:-}
-      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-100}
-      - MAX_HOPS=${MAX_HOPS:-3}
-      - CACHE_SIZE=${CACHE_SIZE:-10000}
-      - CACHE_TTL_SECS=${CACHE_TTL_SECS:-300}
-      - RUST_LOG=${RUST_LOG:-info}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-volumes:
-  nostr-wot-data:
-```
-
-## Production Deployment
-
-### Behind a Reverse Proxy (nginx)
+Point the intended DNS hostname at the server (or its configured Cloudflare origin), add an nginx virtual host and issue a certificate covering that hostname. A certificate for the bare domain alone does not cover subdomains. Route the site to the localhost container port, such as 8091:
 
 ```nginx
-upstream wot_oracle {
-    server 127.0.0.1:8080;
-    keepalive 32;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name wot.example.com;
-
-    ssl_certificate /etc/letsencrypt/live/wot.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/wot.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://wot_oracle;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Important for rate limiting to work correctly
-        proxy_set_header X-Forwarded-For $remote_addr;
-    }
+location / {
+    proxy_pass http://127.0.0.1:8091;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Forwarded "";
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 30s;
 }
 ```
 
-### With Traefik
+The API's IP extractor trusts forwarding headers. The public proxy must overwrite them; do not append an untrusted client-provided chain. When using Cloudflare, configure nginx's real-IP module to trust only Cloudflare's published source networks. Keep the container port inaccessible externally. Exempt health/readiness from response caching.
 
-```yaml
-services:
-  wot-oracle:
-    # ... (same as above)
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.wot.rule=Host(`wot.example.com`)"
-      - "traefik.http.routers.wot.tls.certresolver=letsencrypt"
-      - "traefik.http.services.wot.loadbalancer.server.port=8080"
-```
+## Verification and rollback
 
-## Resource Sizing
+Verify `/health` reports the expected version, `/ready` becomes 200 after events arrive, and `/stats` shows persisted events and increasing indexed follow/mute counts. Exercise a real `/distance` and `/trust` query. Restart once and verify previously indexed data survives. Review logs for database errors and lag recovery.
 
-### Memory
-
-| Graph Size | Recommended RAM |
-|------------|-----------------|
-| < 100k nodes | 512MB |
-| 100k - 500k nodes | 1GB |
-| 500k - 1M nodes | 2GB |
-| > 1M nodes | 4GB+ |
-
-### CPU
-
-- 1 core minimum
-- 2+ cores recommended for concurrent queries
-- BFS queries are CPU-bound and run on a thread pool
-
-### Storage
-
-- SQLite database grows ~100 bytes per node + ~16 bytes per edge
-- 1M nodes with 10M edges: ~1GB database
-- Enable WAL mode (default) for better write performance
-
-## Monitoring
-
-### Health Check
-
-```bash
-curl http://localhost:8080/health
-```
-
-### Statistics
-
-```bash
-curl http://localhost:8080/stats
-```
-
-Returns:
-- `node_count` - Total pubkeys indexed
-- `edge_count` - Total follow relationships
-- `cache.hits/misses` - Cache performance
-- `locks.read_wait_ns` - Lock contention metrics
-
-### Logs
-
-```bash
-# View logs
-docker-compose logs -f wot-oracle
-
-# Increase verbosity
-RUST_LOG=debug docker-compose up
-```
-
-Log levels:
-- `error` - Only errors
-- `warn` - Warnings and errors
-- `info` - Sync progress, startup info (default)
-- `debug` - Query details, cache hits/misses
-- `trace` - Everything (very verbose)
-
-## Backup & Restore
-
-### Backup
-
-```bash
-# Stop the service (optional, for consistency)
-docker-compose stop
-
-# Copy the database
-docker cp wot-oracle:/app/data/wot.db ./backup-$(date +%Y%m%d).db
-
-# Restart
-docker-compose start
-```
-
-### Restore
-
-```bash
-docker-compose stop
-docker cp ./backup.db wot-oracle:/app/data/wot.db
-docker-compose start
-```
-
-## Troubleshooting
-
-### Service won't start
-
-```bash
-# Check logs
-docker-compose logs wot-oracle
-
-# Common issues:
-# - Port already in use: change HTTP_PORT
-# - Permission denied on volume: check Docker volume permissions
-```
-
-### High memory usage
-
-- Reduce `CACHE_SIZE`
-- The graph itself is memory-resident; size scales with indexed pubkeys
-
-### Slow queries
-
-- Check `/stats` for cache hit rate
-- Increase `CACHE_SIZE` or `CACHE_TTL_SECS`
-- Ensure queries use reasonable `max_hops` (lower = faster)
-
-### Rate limit errors (429)
-
-- Increase `RATE_LIMIT_PER_MINUTE`
-- Or implement client-side rate limiting
-
-### No data / empty graph
-
-- Check relay connectivity in logs
-- Ensure relays have kind:3 events
-- Initial sync can take several minutes
+Pin a release image, preferably by digest. To roll back, stop the new container, restore the pre-upgrade database backup if necessary, select the prior image, and restart. Preserve nginx configuration and certificate backups before routing changes. Initial graph population can take time and is not a complete global backfill; see [SYNC.md](SYNC.md).

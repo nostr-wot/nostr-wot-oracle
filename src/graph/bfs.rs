@@ -118,7 +118,8 @@ pub fn compute_distance(graph: &WotGraph, query: &DistanceQuery) -> DistanceResu
     // Handle same node case
     if query.from == query.to {
         // Get Arc<str> reference from graph (or use query's Arc directly - just ref count bump)
-        let pubkey_arc = graph.get_pubkey_arc_by_str(&query.from)
+        let pubkey_arc = graph
+            .get_pubkey_arc_by_str(&query.from)
             .unwrap_or_else(|| Arc::clone(&query.from));
         return DistanceResult::same_node(pubkey_arc);
     }
@@ -126,18 +127,12 @@ pub fn compute_distance(graph: &WotGraph, query: &DistanceQuery) -> DistanceResu
     // Get node IDs and Arc<str> references (uses DashMap, separate from adjacency lock)
     let (from_id, from_arc) = match graph.get_node_id_and_arc(&query.from) {
         Some(pair) => pair,
-        None => return DistanceResult::not_found(
-            Arc::clone(&query.from),
-            Arc::clone(&query.to),
-        ),
+        None => return DistanceResult::not_found(Arc::clone(&query.from), Arc::clone(&query.to)),
     };
 
     let (to_id, to_arc) = match graph.get_node_id_and_arc(&query.to) {
         Some(pair) => pair,
-        None => return DistanceResult::not_found(
-            Arc::clone(&from_arc),
-            Arc::clone(&query.to),
-        ),
+        None => return DistanceResult::not_found(Arc::clone(&from_arc), Arc::clone(&query.to)),
     };
 
     // Single read lock for entire BFS traversal
@@ -154,14 +149,18 @@ pub fn compute_distance(graph: &WotGraph, query: &DistanceQuery) -> DistanceResu
         let mutual_follow = is_direct(from_id, to_id) && is_direct(to_id, from_id);
 
         // Check for direct follow (hops = 1)
-        if is_direct(from_id, to_id) {
+        if query.max_hops > 0 && is_direct(from_id, to_id) {
             return DistanceResult {
                 from: Arc::clone(&from_arc),
                 to: Arc::clone(&to_arc),
                 hops: Some(1),
                 path_count: 1,
                 mutual_follow,
-                bridges: if query.include_bridges { Some(vec![]) } else { None },
+                bridges: if query.include_bridges {
+                    Some(vec![])
+                } else {
+                    None
+                },
             };
         }
 
@@ -210,7 +209,7 @@ fn bidirectional_bfs(
     let mut bwd_dist = 0u32;
     let mut best_distance: Option<u32> = None;
 
-    'outer: while !state.fwd_current.is_empty() || !state.bwd_current.is_empty() {
+    while !state.fwd_current.is_empty() && !state.bwd_current.is_empty() {
         // Check if we should stop
         let current_min_possible = fwd_dist + bwd_dist;
         if let Some(best) = best_distance {
@@ -219,7 +218,7 @@ fn bidirectional_bfs(
             }
         }
 
-        if current_min_possible > u32::from(max_hops) {
+        if current_min_possible >= u32::from(max_hops) {
             break;
         }
 
@@ -254,11 +253,6 @@ fn bidirectional_bfs(
                         if best_distance == Some(total_dist) {
                             state.meeting_nodes.push((neighbor, node_paths, bwd_paths));
                         }
-
-                        // Early exit: if we don't need bridges, one path is enough
-                        if !include_bridges {
-                            break 'outer;
-                        }
                     }
 
                     // Add to next frontier if not visited (single lookup via entry API)
@@ -271,7 +265,7 @@ fn bidirectional_bfs(
                             // Update path count if same distance
                             let (existing_dist, existing_paths) = e.get_mut();
                             if *existing_dist == fwd_dist {
-                                *existing_paths += node_paths;
+                                *existing_paths = existing_paths.saturating_add(node_paths);
                             }
                         }
                     }
@@ -303,11 +297,6 @@ fn bidirectional_bfs(
                         if best_distance == Some(total_dist) {
                             state.meeting_nodes.push((neighbor, fwd_paths, node_paths));
                         }
-
-                        // Early exit: if we don't need bridges, one path is enough
-                        if !include_bridges {
-                            break 'outer;
-                        }
                     }
 
                     // Add to next frontier if not visited (single lookup via entry API)
@@ -320,7 +309,7 @@ fn bidirectional_bfs(
                             // Update path count if same distance
                             let (existing_dist, existing_paths) = e.get_mut();
                             if *existing_dist == bwd_dist {
-                                *existing_paths += node_paths;
+                                *existing_paths = existing_paths.saturating_add(node_paths);
                             }
                         }
                     }
@@ -334,18 +323,19 @@ fn bidirectional_bfs(
     }
 
     match best_distance {
-        Some(hops) if hops as u8 <= max_hops => {
+        Some(hops) if hops <= u32::from(max_hops) => {
             // Calculate total path count
-            let path_count: u64 = state.meeting_nodes
+            let path_count: u64 = state
+                .meeting_nodes
                 .iter()
-                .map(|(_, fwd_paths, bwd_paths)| fwd_paths * bwd_paths)
-                .sum();
+                .map(|(_, fwd_paths, bwd_paths)| fwd_paths.saturating_mul(*bwd_paths))
+                .fold(0u64, u64::saturating_add);
 
             // Collect unique bridge nodes using reusable structures (no allocation)
             let bridges = if include_bridges {
                 // Deduplicate meeting node IDs
                 for (id, _, _) in &state.meeting_nodes {
-                    if state.bridge_set.insert(*id) {
+                    if *id != from_id && *id != to_id && state.bridge_set.insert(*id) {
                         state.bridge_ids.push(*id);
                     }
                 }
@@ -371,7 +361,8 @@ fn bidirectional_bfs(
 pub fn compute_path(graph: &WotGraph, query: &PathQuery) -> PathResult {
     // Handle same node case
     if query.from == query.to {
-        let pubkey_arc = graph.get_pubkey_arc_by_str(&query.from)
+        let pubkey_arc = graph
+            .get_pubkey_arc_by_str(&query.from)
             .unwrap_or_else(|| Arc::clone(&query.from));
         return PathResult {
             from: Arc::clone(&pubkey_arc),
@@ -383,20 +374,24 @@ pub fn compute_path(graph: &WotGraph, query: &PathQuery) -> PathResult {
     // Get node IDs and Arc<str> references
     let (from_id, from_arc) = match graph.get_node_id_and_arc(&query.from) {
         Some(pair) => pair,
-        None => return PathResult {
-            from: Arc::clone(&query.from),
-            to: Arc::clone(&query.to),
-            path: None,
-        },
+        None => {
+            return PathResult {
+                from: Arc::clone(&query.from),
+                to: Arc::clone(&query.to),
+                path: None,
+            }
+        }
     };
 
     let (to_id, to_arc) = match graph.get_node_id_and_arc(&query.to) {
         Some(pair) => pair,
-        None => return PathResult {
-            from: Arc::clone(&from_arc),
-            to: Arc::clone(&query.to),
-            path: None,
-        },
+        None => {
+            return PathResult {
+                from: Arc::clone(&from_arc),
+                to: Arc::clone(&query.to),
+                path: None,
+            }
+        }
     };
 
     // Single read lock for entire BFS traversal
@@ -410,7 +405,7 @@ pub fn compute_path(graph: &WotGraph, query: &PathQuery) -> PathResult {
         };
 
         // Check for direct follow (hops = 1)
-        if is_direct(from_id, to_id) {
+        if query.max_hops > 0 && is_direct(from_id, to_id) {
             return PathResult {
                 from: Arc::clone(&from_arc),
                 to: Arc::clone(&to_arc),
@@ -435,9 +430,9 @@ pub fn compute_path(graph: &WotGraph, query: &PathQuery) -> PathResult {
         let mut fwd_dist = 0u32;
         let mut bwd_dist = 0u32;
 
-        'outer: while !fwd_current.is_empty() || !bwd_current.is_empty() {
+        'outer: while !fwd_current.is_empty() && !bwd_current.is_empty() {
             let current_min_possible = fwd_dist + bwd_dist;
-            if current_min_possible as u8 > query.max_hops {
+            if current_min_possible >= u32::from(query.max_hops) {
                 break;
             }
 
@@ -496,7 +491,9 @@ pub fn compute_path(graph: &WotGraph, query: &PathQuery) -> PathResult {
                 let mut current = meet;
                 while current != from_id {
                     if let Some(&parent) = fwd_parent.get(&current) {
-                        path_ids.push(current);
+                        if current != to_id {
+                            path_ids.push(current);
+                        }
                         current = parent;
                     } else {
                         break;
@@ -538,6 +535,192 @@ pub fn compute_path(graph: &WotGraph, query: &PathQuery) -> PathResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_all_shortest_paths_without_bridges() {
+        let graph = create_test_graph();
+        for include_bridges in [false, true] {
+            let result = compute_distance(
+                &graph,
+                &DistanceQuery {
+                    from: Arc::from("alice"),
+                    to: Arc::from("carol"),
+                    max_hops: 2,
+                    include_bridges,
+                },
+            );
+            assert_eq!(result.path_count, 2);
+        }
+    }
+
+    #[test]
+    fn paths_respect_bounds_and_exclude_endpoints() {
+        let graph = WotGraph::new();
+        graph.update_follows("a", &["b".into()], None, None);
+        graph.update_follows("b", &["c".into()], None, None);
+        for max_hops in 0..=3 {
+            let path = compute_path(
+                &graph,
+                &PathQuery {
+                    from: Arc::from("a"),
+                    to: Arc::from("c"),
+                    max_hops,
+                },
+            );
+            assert_eq!(
+                path.path,
+                if max_hops < 2 {
+                    None
+                } else {
+                    Some(vec![Arc::from("b")])
+                }
+            );
+        }
+        let result = compute_distance(
+            &graph,
+            &DistanceQuery {
+                from: Arc::from("a"),
+                to: Arc::from("b"),
+                max_hops: 0,
+                include_bridges: false,
+            },
+        );
+        assert_eq!(result.hops, None);
+        assert!(compute_path(
+            &graph,
+            &PathQuery {
+                from: Arc::from("a"),
+                to: Arc::from("b"),
+                max_hops: 0,
+            }
+        )
+        .path
+        .is_none());
+    }
+
+    #[test]
+    fn random_graphs_match_reference_bfs() {
+        use std::collections::VecDeque;
+        let mut seed = 0x12345678u64;
+        for _ in 0..40 {
+            let graph = WotGraph::new();
+            let names: Vec<String> = (0..9).map(|i| i.to_string()).collect();
+            for name in &names {
+                graph.get_or_create_node(name);
+            }
+            let mut edges = vec![vec![]; names.len()];
+            for a in 0..names.len() {
+                for b in 0..names.len() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if seed >> 61 < 2 {
+                        edges[a].push(b);
+                    }
+                }
+                graph.update_follows(
+                    &names[a],
+                    &edges[a]
+                        .iter()
+                        .map(|&b| names[b].clone())
+                        .collect::<Vec<_>>(),
+                    None,
+                    None,
+                );
+            }
+            for from in 0..names.len() {
+                let mut distances = vec![None; names.len()];
+                let mut counts = vec![0; names.len()];
+                distances[from] = Some(0u32);
+                counts[from] = 1;
+                let mut queue = VecDeque::from([from]);
+                while let Some(a) = queue.pop_front() {
+                    let next = distances[a].unwrap() + 1;
+                    for &b in &edges[a] {
+                        if distances[b].is_none() {
+                            distances[b] = Some(next);
+                            queue.push_back(b);
+                        }
+                        if distances[b] == Some(next) {
+                            counts[b] += counts[a];
+                        }
+                    }
+                }
+                for to in 0..names.len() {
+                    for max_hops in 0..=8 {
+                        let expected = distances[to].filter(|&d| d <= u32::from(max_hops));
+                        for include_bridges in [false, true] {
+                            let result = compute_distance(
+                                &graph,
+                                &DistanceQuery {
+                                    from: Arc::from(names[from].as_str()),
+                                    to: Arc::from(names[to].as_str()),
+                                    max_hops,
+                                    include_bridges,
+                                },
+                            );
+                            assert_eq!(result.hops, expected);
+                            assert_eq!(
+                                result.path_count,
+                                if expected.is_some() { counts[to] } else { 0 }
+                            );
+                        }
+                        let path = compute_path(
+                            &graph,
+                            &PathQuery {
+                                from: Arc::from(names[from].as_str()),
+                                to: Arc::from(names[to].as_str()),
+                                max_hops,
+                            },
+                        )
+                        .path;
+                        assert_eq!(path.is_some(), expected.is_some());
+                        if let Some(path) = path {
+                            assert_eq!(path.len(), expected.unwrap().saturating_sub(1) as usize);
+                            if from != to {
+                                let mut nodes = vec![from];
+                                nodes.extend(path.iter().map(|pk| pk.parse::<usize>().unwrap()));
+                                nodes.push(to);
+                                for pair in nodes.windows(2) {
+                                    assert!(edges[pair[0]].contains(&pair[1]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_counts_saturate_instead_of_overflowing() {
+        let graph = WotGraph::new();
+        graph.update_follows("source", &["0a".into(), "0b".into()], None, None);
+        for layer in 0..64 {
+            for suffix in ["a", "b"] {
+                graph.update_follows(
+                    &format!("{layer}{suffix}"),
+                    &[format!("{}a", layer + 1), format!("{}b", layer + 1)],
+                    None,
+                    None,
+                );
+            }
+        }
+        for suffix in ["a", "b"] {
+            graph.update_follows(&format!("64{suffix}"), &["target".into()], None, None);
+        }
+        for include_bridges in [false, true] {
+            let result = compute_distance(
+                &graph,
+                &DistanceQuery {
+                    from: Arc::from("source"),
+                    to: Arc::from("target"),
+                    max_hops: 66,
+                    include_bridges,
+                },
+            );
+            assert_eq!(result.hops, Some(66));
+            assert_eq!(result.path_count, u64::MAX);
+        }
+    }
 
     fn create_test_graph() -> WotGraph {
         // Create a simple test graph:

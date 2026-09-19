@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use crate::cache::{CacheKey, QueryCache};
 use crate::config::{Config, MAX_HOPS_LIMIT};
@@ -16,6 +16,7 @@ pub struct DvmService {
     cache: Arc<QueryCache>,
     config: Arc<Config>,
     keys: Keys,
+    query_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl DvmService {
@@ -24,12 +25,19 @@ impl DvmService {
         cache: Arc<QueryCache>,
         config: Arc<Config>,
         private_key: &str,
+        query_slots: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self> {
         let keys = Keys::parse(private_key).context("Failed to parse DVM private key")?;
 
         info!("DVM service pubkey: {}", keys.public_key().to_hex());
 
-        Ok(Self { graph, cache, config, keys })
+        Ok(Self {
+            graph,
+            cache,
+            config,
+            keys,
+            query_slots,
+        })
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -106,11 +114,17 @@ impl DvmService {
                         max_hops = match tag_slice[2].parse::<u8>() {
                             Ok(h) if (1..=MAX_HOPS_LIMIT).contains(&h) => h,
                             Ok(h) => {
-                                warn!("DVM request max_hops {} out of range, clamping to {}", h, MAX_HOPS_LIMIT);
+                                warn!(
+                                    "DVM request max_hops {} out of range, clamping to {}",
+                                    h, MAX_HOPS_LIMIT
+                                );
                                 h.clamp(1, MAX_HOPS_LIMIT)
                             }
                             Err(_) => {
-                                warn!("DVM request invalid max_hops value, using default {}", self.config.max_hops);
+                                warn!(
+                                    "DVM request invalid max_hops value, using default {}",
+                                    self.config.max_hops
+                                );
                                 self.config.max_hops
                             }
                         };
@@ -133,8 +147,12 @@ impl DvmService {
         let (from, to) = match inputs.as_slice() {
             [f, t] => (f.clone(), t.clone()),
             _ => {
-                self.send_error(client, request, "Expected two 'i' tags with pubkeys or 'from'/'to' params")
-                    .await?;
+                self.send_error(
+                    client,
+                    request,
+                    "Expected two 'i' tags with pubkeys or 'from'/'to' params",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -171,13 +189,20 @@ impl DvmService {
                     include_bridges,
                 };
                 let graph = Arc::clone(&self.graph);
-                let result = tokio::task::spawn_blocking(move || {
-                    bfs::compute_distance(&graph, &query)
+                let permit = self.query_slots.clone().acquire_owned().await?;
+                let (result, revision) = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let revision = graph.revision();
+                    (bfs::compute_distance(&graph, &query), revision)
                 })
                 .await
                 .context("BFS computation task failed")?;
-                self.cache.insert(cache_key, &result, &self.graph);
-                debug!("DVM cache miss for {} -> {}, computed and cached", &from[..8], &to[..8]);
+                self.cache.insert(cache_key, &result, &self.graph, revision);
+                debug!(
+                    "DVM cache miss for {} -> {}, computed and cached",
+                    &from[..8],
+                    &to[..8]
+                );
                 result
             }
         } else {
@@ -189,7 +214,9 @@ impl DvmService {
                 include_bridges,
             };
             let graph = Arc::clone(&self.graph);
+            let permit = self.query_slots.clone().acquire_owned().await?;
             tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 bfs::compute_distance(&graph, &query)
             })
             .await
@@ -209,7 +236,8 @@ impl DvmService {
             tags.push(Tag::parse(&["result", &hops.to_string(), "hops"])?);
         }
 
-        let response_event = EventBuilder::new(Kind::Custom(DVM_RESPONSE_KIND), response_content, tags);
+        let response_event =
+            EventBuilder::new(Kind::Custom(DVM_RESPONSE_KIND), response_content, tags);
 
         client.send_event_builder(response_event).await?;
 

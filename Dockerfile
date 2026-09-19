@@ -1,6 +1,6 @@
 # Build stage
-# Transitive crates (e.g. icu_*) require rustc ≥ 1.86; keep in sync with Cargo.lock / deps.
-FROM rust:1.86-slim-bookworm AS builder
+# Keep the compiler and locked dependency graph aligned with CI.
+FROM rust:1.93.0-slim-bookworm AS builder
 
 LABEL org.opencontainers.image.source="https://github.com/nostr-wot/nostr-wot-oracle"
 LABEL org.opencontainers.image.description="Pairwise distance queries for Nostr Web of Trust"
@@ -15,19 +15,19 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 
 # Create dummy main.rs to cache dependencies
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
+    cargo build --locked --release && \
     rm -rf src
 
 # Copy actual source code
 COPY src ./src
 
 # Build the application
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --locked --release
 
 # Runtime stage
 FROM debian:bookworm-slim

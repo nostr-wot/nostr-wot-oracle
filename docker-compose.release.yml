@@ -15,8 +15,9 @@ services:
     image: nostr-wot-oracle:local
     container_name: nostr-wot-oracle
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
-      - "${HTTP_PORT:-8080}:8080"
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
     volumes:
       - nostr-wot-data:/app/data
     environment:

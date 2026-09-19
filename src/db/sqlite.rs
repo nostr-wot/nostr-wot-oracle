@@ -1,9 +1,9 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
-use std::collections::HashMap;
-use std::path::Path;
 use parking_lot::Mutex;
-use tracing::{info, debug, warn};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use tracing::{debug, info};
 
 use crate::graph::WotGraph;
 
@@ -46,7 +46,8 @@ impl Database {
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock();
 
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS nodes (
                 id INTEGER PRIMARY KEY,
                 pubkey TEXT NOT NULL UNIQUE,
@@ -68,12 +69,26 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_edges_follower ON edges(follower_id);
             CREATE INDEX IF NOT EXISTS idx_edges_followed ON edges(followed_id);
 
+            CREATE TABLE IF NOT EXISTS mute_lists (
+                follower_id INTEGER PRIMARY KEY REFERENCES nodes(id),
+                event_id TEXT,
+                created_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mute_edges (
+                follower_id INTEGER NOT NULL REFERENCES nodes(id),
+                followed_id INTEGER NOT NULL REFERENCES nodes(id),
+                PRIMARY KEY (follower_id, followed_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mute_edges_followed ON mute_edges(followed_id);
+
             CREATE TABLE IF NOT EXISTS sync_state (
                 relay_url TEXT PRIMARY KEY,
                 last_event_time INTEGER,
                 last_sync_at INTEGER
             );
-        "#)?;
+        "#,
+        )?;
 
         info!("Database schema initialized");
         Ok(())
@@ -81,76 +96,83 @@ impl Database {
 
     pub fn load_graph(&self, graph: &WotGraph) -> Result<()> {
         let conn = self.conn.lock();
-
-        // Load all nodes
         let mut node_stmt = conn.prepare(
-            "SELECT id, pubkey, kind3_event_id, kind3_created_at FROM nodes ORDER BY id"
+            "SELECT id, pubkey, kind3_event_id, kind3_created_at FROM nodes ORDER BY id",
         )?;
-
         let nodes: Vec<(i64, String, Option<String>, Option<i64>)> = node_stmt
             .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
-            .filter_map(|r| match r {
-                Ok(val) => Some(val),
-                Err(e) => { warn!("Skipping malformed row: {}", e); None }
-            })
-            .collect();
-
+            .collect::<rusqlite::Result<_>>()?;
         info!("Loading {} nodes from database", nodes.len());
-
-        // Create nodes in graph (they will get sequential IDs)
+        let node_indices: HashMap<i64, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _, _, _))| (*id, index))
+            .collect();
+        // Read numeric edges directly: no GROUP_CONCAT buffers or pubkey SQL joins.
+        let mut edge_stmt = conn.prepare(
+            "SELECT follower_id, followed_id FROM edges ORDER BY follower_id, followed_id",
+        )?;
+        let edges: Vec<(i64, i64)> = edge_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut mute_stmt = conn.prepare(
+            "SELECT follower_id, event_id, created_at FROM mute_lists ORDER BY follower_id",
+        )?;
+        let mute_lists: Vec<(i64, Option<String>, Option<i64>)> = mute_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut mute_edge_stmt = conn.prepare(
+            "SELECT follower_id, followed_id FROM mute_edges ORDER BY follower_id, followed_id",
+        )?;
+        let mute_edges: Vec<(i64, i64)> = mute_edge_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mute_authors: HashSet<i64> = mute_lists.iter().map(|list| list.0).collect();
+        for (from, to) in &mute_edges {
+            anyhow::ensure!(
+                mute_authors.contains(from) && node_indices.contains_key(to),
+                "Database contains invalid mute edges"
+            );
+        }
+        for (author, _, _) in &mute_lists {
+            anyhow::ensure!(
+                node_indices.contains_key(author),
+                "Database contains invalid mute metadata"
+            );
+        }
+        // Validate the complete snapshot before changing the graph.
+        for (from, to) in &edges {
+            anyhow::ensure!(
+                node_indices.contains_key(from) && node_indices.contains_key(to),
+                "Database contains an edge referencing a missing node"
+            );
+        }
         for (_, pubkey, _, _) in &nodes {
             graph.get_or_create_node(pubkey);
         }
-
-        // Load edges grouped by follower
-        let mut edge_stmt = conn.prepare(
-            "SELECT e.follower_id, n.pubkey, GROUP_CONCAT(n2.pubkey) as follows
-             FROM edges e
-             JOIN nodes n ON e.follower_id = n.id
-             JOIN nodes n2 ON e.followed_id = n2.id
-             GROUP BY e.follower_id"
-        )?;
-
-        let mut edge_count = 0;
-        let edges: Vec<(String, String)> = edge_stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .filter_map(|r| match r {
-                Ok(val) => Some(val),
-                Err(e) => { warn!("Skipping malformed row: {}", e); None }
-            })
-            .collect();
-
-        // Build a HashMap for O(1) lookup instead of O(N) linear scan per edge
-        let node_info_map: HashMap<&str, (&Option<String>, &Option<i64>)> = nodes.iter()
-            .map(|(_, pk, eid, cat)| (pk.as_str(), (eid, cat)))
-            .collect();
-
-        for (follower_pubkey, follows_csv) in edges {
-            let follows: Vec<String> = follows_csv.split(',').map(|s| s.to_string()).collect();
-            edge_count += follows.len();
-
-            // Look up the node's event info in O(1)
-            let (event_id, created_at) = node_info_map
-                .get(follower_pubkey.as_str())
-                .map(|(eid, cat)| ((*eid).clone(), **cat))
-                .unwrap_or((None, None));
-
-            graph.update_follows(&follower_pubkey, &follows, event_id, created_at);
+        let mut edge_index = 0;
+        for (id, pubkey, event_id, created_at) in &nodes {
+            let mut follows = Vec::new();
+            while edge_index < edges.len() && edges[edge_index].0 == *id {
+                let followed_index = node_indices[&edges[edge_index].1];
+                follows.push(nodes[followed_index].1.clone());
+                edge_index += 1;
+            }
+            // Empty follow lists still carry replaceable-event provenance.
+            graph.update_follows(pubkey, &follows, event_id.clone(), *created_at);
         }
-
-        info!("Loaded {} edges from database", edge_count);
+        let mut mute_index = 0;
+        for (id, event_id, created_at) in mute_lists {
+            let mut muted = Vec::new();
+            while mute_index < mute_edges.len() && mute_edges[mute_index].0 == id {
+                muted.push(nodes[node_indices[&mute_edges[mute_index].1]].1.clone());
+                mute_index += 1;
+            }
+            graph.update_mutes(&nodes[node_indices[&id]].1, &muted, event_id, created_at);
+        }
+        info!("Loaded {} edges from database", edges.len());
         Ok(())
     }
 
@@ -186,213 +208,134 @@ impl Database {
     }
 
     #[allow(dead_code)] // Public API for direct follow list updates
-    pub fn update_follows(&self, follower_pubkey: &str, follows: &[String], event_id: Option<&str>, created_at: Option<i64>) -> Result<()> {
-        if follows.is_empty() {
-            // Just update the node, clear edges
-            let mut conn = self.conn.lock();
-            let tx = conn.transaction()?;
-            let now = chrono::Utc::now().timestamp();
-
-            tx.execute(
-                r#"
-                INSERT INTO nodes (pubkey, kind3_event_id, kind3_created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(pubkey) DO UPDATE SET
-                    kind3_event_id = COALESCE(?2, kind3_event_id),
-                    kind3_created_at = COALESCE(?3, kind3_created_at),
-                    updated_at = ?4
-                "#,
-                params![follower_pubkey, event_id, created_at, now],
-            )?;
-
-            let follower_id: i64 = tx.query_row(
-                "SELECT id FROM nodes WHERE pubkey = ?1",
-                params![follower_pubkey],
-                |row| row.get(0),
-            )?;
-
-            tx.execute("DELETE FROM edges WHERE follower_id = ?1", params![follower_id])?;
-            tx.commit()?;
-            return Ok(());
-        }
-
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        let now = chrono::Utc::now().timestamp();
-
-        // Upsert follower node
-        tx.execute(
-            r#"
-            INSERT INTO nodes (pubkey, kind3_event_id, kind3_created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(pubkey) DO UPDATE SET
-                kind3_event_id = COALESCE(?2, kind3_event_id),
-                kind3_created_at = COALESCE(?3, kind3_created_at),
-                updated_at = ?4
-            "#,
-            params![follower_pubkey, event_id, created_at, now],
-        )?;
-
-        let follower_id: i64 = tx.query_row(
-            "SELECT id FROM nodes WHERE pubkey = ?1",
-            params![follower_pubkey],
-            |row| row.get(0),
-        )?;
-
-        // Delete existing edges (single statement)
-        tx.execute("DELETE FROM edges WHERE follower_id = ?1", params![follower_id])?;
-
-        // Batch insert followed nodes using prepared statement
-        {
-            let mut insert_node_stmt = tx.prepare_cached(
-                "INSERT INTO nodes (pubkey, updated_at) VALUES (?1, ?2) ON CONFLICT(pubkey) DO NOTHING"
-            )?;
-
-            for follow_pubkey in follows {
-                insert_node_stmt.execute(params![follow_pubkey, now])?;
-            }
-        }
-
-        // Batch fetch all followed node IDs - chunk to avoid SQLite parameter limit (~999)
-        const CHUNK_SIZE: usize = 500;
-        let mut followed_ids: Vec<i64> = Vec::with_capacity(follows.len());
-
-        for chunk in follows.chunks(CHUNK_SIZE) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let in_clause = placeholders.join(",");
-            let select_sql = format!("SELECT id FROM nodes WHERE pubkey IN ({})", in_clause);
-
-            let mut select_stmt = tx.prepare(&select_sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = chunk
-                .iter()
-                .map(|s| s as &dyn rusqlite::ToSql)
-                .collect();
-
-            let rows = select_stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
-            followed_ids.extend(rows.filter_map(|r| r.ok()));
-        }
-
-        // Batch insert edges using prepared statement
-        {
-            let mut insert_edge_stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO edges (follower_id, followed_id) VALUES (?1, ?2)"
-            )?;
-
-            for followed_id in &followed_ids {
-                insert_edge_stmt.execute(params![follower_id, followed_id])?;
-            }
-        }
-
-        tx.commit()?;
-        debug!("Updated follows for {} with {} follows", follower_pubkey, follows.len());
-
+    pub fn update_follows(
+        &self,
+        follower_pubkey: &str,
+        follows: &[String],
+        event_id: Option<&str>,
+        created_at: Option<i64>,
+    ) -> Result<()> {
+        self.update_follows_batch(&[FollowUpdateBatch {
+            pubkey: follower_pubkey,
+            follows,
+            event_id,
+            created_at,
+        }])?;
         Ok(())
     }
 
-    /// Batch update multiple follow lists in a single transaction.
-    /// Much faster than calling update_follows() in a loop (1 commit vs N commits).
+    /// Persist each author's winning event atomically, changing only affected edges.
+    /// Returns the number of authors whose updates were accepted.
     pub fn update_follows_batch(&self, updates: &[FollowUpdateBatch<'_>]) -> Result<usize> {
+        self.update_lists_batch(updates, false)
+    }
+
+    /// Persist public kind-10000 mute lists independently of follow metadata.
+    pub fn update_mutes_batch(&self, updates: &[FollowUpdateBatch<'_>]) -> Result<usize> {
+        self.update_lists_batch(updates, true)
+    }
+
+    fn update_lists_batch(&self, updates: &[FollowUpdateBatch<'_>], mutes: bool) -> Result<usize> {
         if updates.is_empty() {
             return Ok(0);
+        }
+        let mut winners: HashMap<&str, &FollowUpdateBatch<'_>> = HashMap::new();
+        for update in updates {
+            match winners.get(update.pubkey) {
+                Some(previous)
+                    if !event_wins(
+                        update.created_at,
+                        update.event_id,
+                        previous.created_at,
+                        previous.event_id,
+                    ) => {}
+                _ => {
+                    winners.insert(update.pubkey, update);
+                }
+            }
         }
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let now = chrono::Utc::now().timestamp();
-
-        // Scope for prepared statements - must be dropped before tx.commit()
-        let success_count = {
-            // Prepare statements once, reuse for all updates
-            let mut upsert_node_stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO nodes (pubkey, kind3_event_id, kind3_created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(pubkey) DO UPDATE SET
-                    kind3_event_id = COALESCE(?2, kind3_event_id),
-                    kind3_created_at = COALESCE(?3, kind3_created_at),
-                    updated_at = ?4
-                "#,
-            )?;
-
-            let mut get_id_stmt = tx.prepare_cached(
-                "SELECT id FROM nodes WHERE pubkey = ?1"
-            )?;
-
-            let mut delete_edges_stmt = tx.prepare_cached(
-                "DELETE FROM edges WHERE follower_id = ?1"
-            )?;
-
-            let mut insert_follow_node_stmt = tx.prepare_cached(
+        let mut accepted = 0;
+        {
+            let mut get_node = tx.prepare_cached(if mutes {
+                "SELECT n.id, m.event_id, m.created_at FROM nodes n LEFT JOIN mute_lists m ON n.id = m.follower_id WHERE n.pubkey = ?1"
+            } else {
+                "SELECT id, kind3_event_id, kind3_created_at FROM nodes WHERE pubkey = ?1"
+            })?;
+            let mut upsert_node = tx.prepare_cached(if mutes {
+                "INSERT INTO mute_lists (follower_id, event_id, created_at, updated_at)
+                 VALUES ((SELECT id FROM nodes WHERE pubkey = ?1), ?2, ?3, ?4)
+                 ON CONFLICT(follower_id) DO UPDATE SET event_id = ?2, created_at = ?3, updated_at = ?4"
+            } else {
+                "INSERT INTO nodes (pubkey, kind3_event_id, kind3_created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(pubkey) DO UPDATE SET
+                 kind3_event_id = ?2, kind3_created_at = ?3, updated_at = ?4"
+            })?;
+            // These identifiers are internal constants, never user-provided SQL.
+            let edge_table = if mutes { "mute_edges" } else { "edges" };
+            let mut old_edges = tx.prepare_cached(&format!(
+                "SELECT n.pubkey, e.followed_id FROM {edge_table} e JOIN nodes n ON n.id = e.followed_id WHERE e.follower_id = ?1"
+            ))?;
+            let mut delete_edge = tx.prepare_cached(&format!(
+                "DELETE FROM {edge_table} WHERE follower_id = ?1 AND followed_id = ?2"
+            ))?;
+            let mut insert_node = tx.prepare_cached(
                 "INSERT INTO nodes (pubkey, updated_at) VALUES (?1, ?2) ON CONFLICT(pubkey) DO NOTHING"
             )?;
-
-            let mut insert_edge_stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO edges (follower_id, followed_id) VALUES (?1, ?2)"
-            )?;
-
-            let mut success_count = 0;
-
-            for update in updates {
-                // Upsert follower node
-                upsert_node_stmt.execute(params![
+            let mut insert_edge = tx.prepare_cached(&format!(
+                "INSERT INTO {edge_table} (follower_id, followed_id) VALUES (?1, ?2)"
+            ))?;
+            for update in winners.values() {
+                let existing: Option<(i64, Option<String>, Option<i64>)> = get_node
+                    .query_row(params![update.pubkey], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()?;
+                if let Some((_, ref id, ts)) = existing {
+                    if !event_wins(update.created_at, update.event_id, ts, id.as_deref()) {
+                        continue;
+                    }
+                }
+                if mutes {
+                    insert_node.execute(params![update.pubkey, now])?;
+                }
+                upsert_node.execute(params![
                     update.pubkey,
                     update.event_id,
                     update.created_at,
                     now
                 ])?;
-
-                let follower_id: i64 = get_id_stmt.query_row(
-                    params![update.pubkey],
-                    |row| row.get(0),
-                )?;
-
-                // Delete existing edges
-                delete_edges_stmt.execute(params![follower_id])?;
-
-                if update.follows.is_empty() {
-                    success_count += 1;
-                    continue;
+                let follower_id: i64 =
+                    get_node.query_row(params![update.pubkey], |row| row.get(0))?;
+                let previous: HashMap<String, i64> = old_edges
+                    .query_map(params![follower_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let desired: HashSet<&str> = update.follows.iter().map(String::as_str).collect();
+                for (pubkey, id) in &previous {
+                    if !desired.contains(pubkey.as_str()) {
+                        delete_edge.execute(params![follower_id, id])?;
+                    }
                 }
-
-                // Insert followed nodes
-                for follow_pubkey in update.follows {
-                    insert_follow_node_stmt.execute(params![follow_pubkey, now])?;
+                for pubkey in desired {
+                    if !previous.contains_key(pubkey) {
+                        insert_node.execute(params![pubkey, now])?;
+                        let followed_id: i64 =
+                            get_node.query_row(params![pubkey], |row| row.get(0))?;
+                        insert_edge.execute(params![follower_id, followed_id])?;
+                    }
                 }
-
-                // Batch fetch followed node IDs - chunk to avoid SQLite parameter limit
-                const CHUNK_SIZE: usize = 500;
-                let mut followed_ids: Vec<i64> = Vec::with_capacity(update.follows.len());
-
-                for chunk in update.follows.chunks(CHUNK_SIZE) {
-                    let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                    let in_clause = placeholders.join(",");
-                    let select_sql = format!("SELECT id FROM nodes WHERE pubkey IN ({})", in_clause);
-
-                    let mut select_stmt = tx.prepare(&select_sql)?;
-                    let params_vec: Vec<&dyn rusqlite::ToSql> = chunk
-                        .iter()
-                        .map(|s| s as &dyn rusqlite::ToSql)
-                        .collect();
-
-                    let rows = select_stmt.query_map(params_vec.as_slice(), |row| row.get::<_, i64>(0))?;
-                    followed_ids.extend(rows.filter_map(|r| r.ok()));
-                }
-
-                // Insert edges
-                for followed_id in &followed_ids {
-                    insert_edge_stmt.execute(params![follower_id, followed_id])?;
-                }
-
-                success_count += 1;
+                accepted += 1;
             }
-
-            success_count
-        }; // Prepared statements dropped here
-
+        }
         tx.commit()?;
-        debug!("Batch persisted {} follow updates", success_count);
-
-        Ok(success_count)
+        debug!(
+            "Batch persisted {} list updates (mutes={})",
+            accepted, mutes
+        );
+        Ok(accepted)
     }
 
     #[allow(dead_code)] // Public API for sync state inspection
@@ -441,19 +384,33 @@ impl Database {
     pub fn get_stats(&self) -> Result<(usize, usize)> {
         let conn = self.conn.lock();
 
-        let node_count: usize = conn.query_row(
-            "SELECT COUNT(*) FROM nodes",
-            [],
-            |row| row.get(0),
-        )?;
+        let node_count: usize =
+            conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
 
-        let edge_count: usize = conn.query_row(
-            "SELECT COUNT(*) FROM edges",
-            [],
-            |row| row.get(0),
-        )?;
+        let edge_count: usize =
+            conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
 
         Ok((node_count, edge_count))
+    }
+}
+
+/// NIP-01 replaceable ordering: newest timestamp, then lowest event ID.
+fn event_wins(
+    new_ts: Option<i64>,
+    new_id: Option<&str>,
+    old_ts: Option<i64>,
+    old_id: Option<&str>,
+) -> bool {
+    match (new_ts, old_ts) {
+        (Some(new), Some(old)) if new != old => new > old,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true, // Preserve direct, unversioned graph manipulation.
+        _ => match (new_id, old_id) {
+            (Some(new), Some(old)) => new < old,
+            (Some(_), None) => true,
+            _ => false,
+        },
     }
 }
 
@@ -477,8 +434,12 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db = Database::open(temp_file.path()).unwrap();
 
-        let id1 = db.upsert_node("pubkey1", Some("event1"), Some(1000)).unwrap();
-        let id2 = db.upsert_node("pubkey1", Some("event2"), Some(2000)).unwrap();
+        let id1 = db
+            .upsert_node("pubkey1", Some("event1"), Some(1000))
+            .unwrap();
+        let id2 = db
+            .upsert_node("pubkey1", Some("event2"), Some(2000))
+            .unwrap();
 
         assert_eq!(id1, id2); // Same pubkey should return same ID
     }
@@ -493,7 +454,8 @@ mod tests {
             &["bob".to_string(), "carol".to_string()],
             Some("event1"),
             Some(1000),
-        ).unwrap();
+        )
+        .unwrap();
 
         let (nodes, edges) = db.get_stats().unwrap();
         assert_eq!(nodes, 3); // alice, bob, carol
@@ -505,8 +467,10 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db = Database::open(temp_file.path()).unwrap();
 
-        db.update_follows("alice", &["bob".to_string()], None, None).unwrap();
-        db.update_follows("bob", &["carol".to_string()], None, None).unwrap();
+        db.update_follows("alice", &["bob".to_string()], None, None)
+            .unwrap();
+        db.update_follows("bob", &["carol".to_string()], None, None)
+            .unwrap();
 
         let graph = WotGraph::new();
         db.load_graph(&graph).unwrap();
@@ -560,5 +524,227 @@ mod tests {
         let (nodes, edges) = db.get_stats().unwrap();
         assert_eq!(nodes, 5); // alice, bob, carol, dave, eve
         assert_eq!(edges, 3); // alice->bob, alice->carol, dave->eve
+    }
+    #[test]
+    fn empty_follow_event_survives_restart_and_rejects_older_events() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(file.path()).unwrap();
+            db.update_follows("alice", &["bob".into()], Some("old"), Some(10))
+                .unwrap();
+            db.update_follows("alice", &[], Some("new"), Some(20))
+                .unwrap();
+        }
+        let db = Database::open(file.path()).unwrap();
+        let graph = WotGraph::new();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(
+            graph.get_node_info("alice").unwrap().kind3_created_at,
+            Some(20)
+        );
+        assert!(!graph.update_follows("alice", &["bob".into()], Some("old".into()), Some(10)));
+        assert_eq!(graph.get_follows("alice").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn persistence_rejects_stale_duplicate_and_losing_tie_events() {
+        let db = Database::open(":memory:").unwrap();
+        db.update_follows("alice", &["bob".into()], Some("b"), Some(20))
+            .unwrap();
+        for (id, timestamp) in [
+            (Some("a"), Some(19)),
+            (Some("c"), Some(20)),
+            (Some("b"), Some(20)),
+            (None, None),
+        ] {
+            db.update_follows("alice", &[], id, timestamp).unwrap();
+            assert_eq!(db.get_stats().unwrap().1, 1);
+        }
+        db.update_follows("alice", &[], Some("a"), Some(20))
+            .unwrap();
+        let graph = WotGraph::new();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(
+            graph
+                .get_node_info("alice")
+                .unwrap()
+                .kind3_event_id
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(db.get_stats().unwrap().1, 0);
+    }
+
+    #[test]
+    fn batch_coalesces_authors_before_creating_edges_or_nodes() {
+        let db = Database::open(":memory:").unwrap();
+        let loser = vec!["loser_only".into()];
+        let winner = vec!["winner_only".into()];
+        let updates = [
+            FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &loser,
+                event_id: Some("b"),
+                created_at: Some(20),
+            },
+            FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &winner,
+                event_id: Some("a"),
+                created_at: Some(20),
+            },
+            FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &loser,
+                event_id: Some("0"),
+                created_at: Some(19),
+            },
+        ];
+        assert_eq!(db.update_follows_batch(&updates).unwrap(), 1);
+        assert_eq!(db.get_stats().unwrap(), (2, 1));
+        assert_eq!(db.update_follows_batch(&updates).unwrap(), 0);
+        let graph = WotGraph::new();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(graph.get_follows("alice").unwrap(), winner);
+    }
+
+    #[test]
+    fn metadata_updates_do_not_rewrite_edges_and_deltas_touch_only_changes() {
+        let db = Database::open(":memory:").unwrap();
+        db.update_follows("alice", &["bob".into(), "carol".into()], Some("a"), Some(1))
+            .unwrap();
+        db.conn.lock().execute_batch(
+            "CREATE TABLE edge_changes (operation TEXT);
+             CREATE TRIGGER record_insert AFTER INSERT ON edges BEGIN INSERT INTO edge_changes VALUES ('insert'); END;
+             CREATE TRIGGER record_delete AFTER DELETE ON edges BEGIN INSERT INTO edge_changes VALUES ('delete'); END;"
+        ).unwrap();
+        db.update_follows(
+            "alice",
+            &["carol".into(), "bob".into(), "bob".into()],
+            Some("b"),
+            Some(2),
+        )
+        .unwrap();
+        let count = || {
+            db.conn
+                .lock()
+                .query_row("SELECT COUNT(*) FROM edge_changes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 0);
+        db.update_follows("alice", &["bob".into(), "dave".into()], Some("c"), Some(3))
+            .unwrap();
+        assert_eq!(count(), 2);
+    }
+
+    #[test]
+    fn failed_edge_write_rolls_back_metadata_and_deletions() {
+        let db = Database::open(":memory:").unwrap();
+        db.update_follows("alice", &["bob".into()], Some("a"), Some(1))
+            .unwrap();
+        db.conn.lock().execute_batch(
+            "CREATE TRIGGER fail_insert BEFORE INSERT ON edges BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        assert!(db
+            .update_follows("alice", &["carol".into()], Some("b"), Some(2))
+            .is_err());
+        let graph = WotGraph::new();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(graph.get_follows("alice").unwrap(), vec!["bob"]);
+        assert_eq!(
+            graph.get_node_info("alice").unwrap().kind3_created_at,
+            Some(1)
+        );
+        assert_eq!(db.get_stats().unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn graph_load_reports_corrupt_edges_before_mutating_graph() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_node("alice", None, None).unwrap();
+        db.conn
+            .lock()
+            .execute("INSERT INTO edges VALUES (1, 999)", [])
+            .unwrap();
+        let graph = WotGraph::new();
+        assert!(db.load_graph(&graph).is_err());
+        assert_eq!(graph.stats().node_count, 0);
+    }
+    #[test]
+    fn empty_mutes_survive_restart_independently_of_follows() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(file.path()).unwrap();
+            db.update_follows("alice", &["bob".into()], Some("follow"), Some(100))
+                .unwrap();
+            let muted = vec!["carol".into()];
+            db.update_mutes_batch(&[FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &muted,
+                event_id: Some("mute"),
+                created_at: Some(10),
+            }])
+            .unwrap();
+            db.update_mutes_batch(&[FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &[],
+                event_id: Some("unmute"),
+                created_at: Some(20),
+            }])
+            .unwrap();
+        }
+        let db = Database::open(file.path()).unwrap();
+        let graph = WotGraph::new();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(graph.get_follows("alice").unwrap(), vec!["bob"]);
+        assert_eq!(graph.get_mutes_page("alice", 0, 10), Some((vec![], 0)));
+        assert_eq!(graph.get_mutes_page("bob", 0, 10), None);
+        assert!(!graph.update_mutes("alice", &["carol".into()], Some("mute".into()), Some(10)));
+        assert!(graph.update_mutes(
+            "alice",
+            &["carol".into()],
+            Some("new-mute".into()),
+            Some(30)
+        ));
+        assert_eq!(
+            graph.get_node_info("alice").unwrap().kind3_created_at,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn mute_batch_coalesces_and_rejects_stale_events() {
+        let db = Database::open(":memory:").unwrap();
+        let muted = vec!["bob".into()];
+        let updates = [
+            FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &muted,
+                event_id: Some("b"),
+                created_at: Some(20),
+            },
+            FollowUpdateBatch {
+                pubkey: "alice",
+                follows: &[],
+                event_id: Some("a"),
+                created_at: Some(20),
+            },
+        ];
+        assert_eq!(db.update_mutes_batch(&updates).unwrap(), 1);
+        assert_eq!(db.update_mutes_batch(&updates).unwrap(), 0);
+        assert_eq!(db.get_stats().unwrap(), (1, 0));
+        let conn = db.conn.lock();
+        let metadata: (String, i64) = conn
+            .query_row("SELECT event_id, created_at FROM mute_lists", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(metadata, ("a".into(), 20));
+        drop(conn);
+        db.update_follows("alice", &["bob".into()], Some("follow"), Some(1))
+            .unwrap();
+        assert_eq!(db.get_stats().unwrap(), (2, 1));
     }
 }

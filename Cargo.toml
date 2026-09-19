@@ -1,7 +1,8 @@
 [package]
 name = "wot-oracle"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.93"
 description = "Nostr Web of Trust Oracle - indexes follow graph and provides distance queries"
 license = "MIT"
 
@@ -29,6 +30,8 @@ anyhow = "1"
 base64ct = "=1.6.0"
 
 [dev-dependencies]
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 tempfile = "3"
 
 [profile.release]
