@@ -287,8 +287,25 @@ fn process_event(event: &Event) -> Option<ListUpdate> {
 // Commit before publishing changes to readers. A database error leaves the graph untouched;
 // restart can reconstruct any committed batch even if the process exits while applying it.
 fn persist_and_apply(db: &Database, graph: &WotGraph, updates: &[ListUpdate]) -> Result<usize> {
+    // Select once for persistence and publication so superseded events cannot
+    // allocate nodes or repeatedly rebuild the same author's adjacency.
+    let mut winners = std::collections::HashMap::new();
+    for (index, update) in updates.iter().enumerate() {
+        let slot = winners
+            .entry((update.kind, update.pubkey.as_str()))
+            .or_insert(index);
+        let previous = &updates[*slot];
+        if update.created_at > previous.created_at
+            || (update.created_at == previous.created_at && update.event_id < previous.event_id)
+        {
+            *slot = index;
+        }
+    }
+    let mut indices: Vec<usize> = winners.into_values().collect();
+    indices.sort_unstable();
+    let selected: Vec<&ListUpdate> = indices.into_iter().map(|index| &updates[index]).collect();
     let items = |kind| {
-        updates
+        selected
             .iter()
             .filter(|u| u.kind == kind)
             .map(|u| FollowUpdateBatch {
@@ -300,7 +317,7 @@ fn persist_and_apply(db: &Database, graph: &WotGraph, updates: &[ListUpdate]) ->
             .collect::<Vec<_>>()
     };
     let count = db.update_follows_batch(&items(3))? + db.update_mutes_batch(&items(MUTE_KIND))?;
-    for update in updates {
+    for update in selected {
         if update.kind == MUTE_KIND {
             graph.update_mutes(
                 &update.pubkey,
@@ -379,6 +396,30 @@ mod tests {
         assert!(restored.mute_evidence("a", "b").source_mutes_target);
         persist_and_apply(&db, &graph, &[update(MUTE_KIND, 30, &[])]).unwrap();
         assert!(!graph.mute_evidence("a", "b").source_mutes_target);
+    }
+
+    #[test]
+    fn superseded_batch_targets_never_enter_the_live_graph() {
+        let db = Database::open(":memory:").unwrap();
+        let graph = WotGraph::new();
+        let mut tie_winner = update(3, 20, &["follow-winner"]);
+        tie_winner.event_id = "00".into();
+        let updates = [
+            update(3, 10, &["obsolete-follow"]),
+            update(MUTE_KIND, 10, &["obsolete-mute"]),
+            update(3, 20, &["losing-tie"]),
+            tie_winner,
+            update(MUTE_KIND, 20, &[]),
+        ];
+        assert_eq!(persist_and_apply(&db, &graph, &updates).unwrap(), 2);
+        assert_eq!(graph.get_node_id("obsolete-follow"), None);
+        assert_eq!(graph.get_node_id("obsolete-mute"), None);
+        assert_eq!(graph.get_node_id("losing-tie"), None);
+        assert_eq!(graph.get_follows("a"), Some(vec!["follow-winner".into()]));
+        assert_eq!(graph.get_mutes_page("a", 0, 10), Some((vec![], 0)));
+        let restored = WotGraph::new();
+        db.load_graph(&restored).unwrap();
+        assert_eq!(graph.stats().node_count, restored.stats().node_count);
     }
 
     #[test]

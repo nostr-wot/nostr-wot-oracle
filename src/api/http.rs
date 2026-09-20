@@ -289,26 +289,75 @@ pub async fn batch_distance(
         });
         order.push(index);
     }
-    let mut computed = Vec::with_capacity(unique.len());
-    for target in unique {
-        computed.push(
-            get_distance(
-                State(state.clone()),
-                Query(DistanceQueryParams {
-                    from: request.from.clone(),
-                    to: target,
-                    max_hops: request.max_hops,
-                    include_bridges: request.include_bridges,
-                    bypass_cache: request.bypass_cache,
-                }),
-            )
-            .await?
-            .0,
-        );
+    let mut computed = vec![None; unique.len()];
+    let mut misses = Vec::new();
+    let from_id = state.graph.get_node_id(&request.from);
+    for (index, target) in unique.into_iter().enumerate() {
+        let key = from_id
+            .zip(state.graph.get_node_id(&target))
+            .map(|(from, to)| CacheKey::new(from, to, request.max_hops, request.include_bridges));
+        if !request.bypass_cache {
+            if let Some(hit) = key
+                .as_ref()
+                .and_then(|key| state.cache.get(key, &state.graph))
+            {
+                computed[index] = Some(hit);
+                continue;
+            }
+        }
+        misses.push((index, target));
+    }
+    // A batch is bounded to 100 targets. Dispatch its misses together, retaining
+    // one permit until completion instead of scheduling one blocking job per pair.
+    // Cached-only batches remain available even when computation is saturated.
+    if !misses.is_empty() {
+        let permit = query_permit(&state)?;
+        let graph = Arc::clone(&state.graph);
+        let cache = Arc::clone(&state.cache);
+        let from: Arc<str> = Arc::from(request.from.as_str());
+        let max_hops = request.max_hops;
+        let include_bridges = request.include_bridges;
+        let results = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            misses
+                .into_iter()
+                .map(|(index, target)| {
+                    let revision = graph.revision();
+                    let query = bfs::DistanceQuery {
+                        from: Arc::clone(&from),
+                        to: Arc::from(target.as_str()),
+                        max_hops,
+                        include_bridges,
+                    };
+                    let result = bfs::compute_distance(&graph, &query);
+                    if let (Some(from_id), Some(to_id)) =
+                        (graph.get_node_id(&from), graph.get_node_id(&target))
+                    {
+                        cache.insert(
+                            CacheKey::new(from_id, to_id, max_hops, include_bridges),
+                            &result,
+                            &graph,
+                            revision,
+                        );
+                    }
+                    (index, result)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| ErrorResponse::internal("Internal computation error"))?;
+        for (index, result) in results {
+            computed[index] = Some(result);
+        }
     }
     let results = order
         .into_iter()
-        .map(|index| computed[index].clone())
+        .map(|index| {
+            computed[index]
+                .as_ref()
+                .expect("every target resolved")
+                .clone()
+        })
         .collect();
 
     Ok(Json(BatchDistanceResponse {
@@ -760,6 +809,115 @@ mod tests {
         assert_eq!(value["results"][0]["hops"], 1);
         assert_eq!(value["results"][1]["hops"], 0);
         assert_eq!(value["results"][0], value["results"][2]);
+    }
+
+    #[tokio::test]
+    async fn batch_matches_individual_queries_with_mixed_cache_and_bridges() {
+        let state = create_test_state();
+        let from = "a".repeat(64);
+        let middle = "b".repeat(64);
+        let target = "c".repeat(64);
+        state
+            .graph
+            .update_follows(&middle, std::slice::from_ref(&target), None, None);
+        // Populate only one entry: the batch must combine hits and computed misses.
+        let _ = get_distance(
+            State(state.clone()),
+            Query(DistanceQueryParams {
+                from: from.clone(),
+                to: middle.clone(),
+                max_hops: 3,
+                include_bridges: true,
+                bypass_cache: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let targets = vec![target.clone(), middle, "d".repeat(64), from.clone(), target];
+        let batch = batch_distance(
+            State(state.clone()),
+            Json(BatchDistanceRequest {
+                from: from.clone(),
+                targets: targets.clone(),
+                max_hops: 3,
+                include_bridges: true,
+                bypass_cache: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        for (target, actual) in targets.iter().zip(&batch.results) {
+            let expected = get_distance(
+                State(state.clone()),
+                Query(DistanceQueryParams {
+                    from: from.clone(),
+                    to: target.clone(),
+                    max_hops: 3,
+                    include_bridges: true,
+                    bypass_cache: true,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_cache_hits_need_no_worker_but_misses_respect_capacity() {
+        let state = create_test_state();
+        let from = "a".repeat(64);
+        let to = "b".repeat(64);
+        let _ = get_distance(
+            State(state.clone()),
+            Query(DistanceQueryParams {
+                from: from.clone(),
+                to: to.clone(),
+                max_hops: 3,
+                include_bridges: false,
+                bypass_cache: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let _permits = state
+            .query_slots
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        for targets in [vec![], vec![to.clone(), to.clone()]] {
+            assert!(batch_distance(
+                State(state.clone()),
+                Json(BatchDistanceRequest {
+                    from: from.clone(),
+                    targets,
+                    max_hops: 3,
+                    include_bridges: false,
+                    bypass_cache: false,
+                })
+            )
+            .await
+            .is_ok());
+        }
+        let error = batch_distance(
+            State(state),
+            Json(BatchDistanceRequest {
+                from,
+                targets: vec![to],
+                max_hops: 3,
+                include_bridges: false,
+                bypass_cache: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "QUERY_BUSY");
     }
 
     #[tokio::test]

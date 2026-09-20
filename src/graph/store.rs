@@ -61,6 +61,20 @@ fn accepts_event(
     }
 }
 
+/// Validated database snapshot. Edge IDs index this snapshot's node vector.
+pub(crate) struct SnapshotNode {
+    pub pubkey: String,
+    pub info: NodeInfo,
+    pub follows: Vec<u32>,
+    pub mutes: Option<SnapshotMuteList>,
+}
+
+pub(crate) struct SnapshotMuteList {
+    pub ids: Vec<u32>,
+    pub event_id: Option<String>,
+    pub created_at: Option<i64>,
+}
+
 pub struct WotGraph {
     // Writers serialize event ordering, adjacency diffs, and metadata publication.
     mutation: Mutex<()>,
@@ -92,6 +106,85 @@ impl WotGraph {
         }
     }
 
+    /// Merge a validated numeric snapshot while serializing live writers. Build
+    /// reverse adjacency in source-ID order once, avoiding sorted Vec insertions.
+    pub(crate) fn restore_nodes(&self, nodes: Vec<SnapshotNode>) {
+        let _mutation = self.mutation.lock();
+        let ids: Vec<u32> = nodes
+            .iter()
+            .map(|node| self.get_or_create_node_locked(&node.pubkey))
+            .collect();
+        let mut follows = self.follows.write();
+        let mut followers = self.followers.write();
+        let mut metadata = self.node_info.write();
+        let mut mutes = self.mutes.write();
+        let mut topology_changed = false;
+        let mut mutes_changed = false;
+        for (index, node) in nodes.into_iter().enumerate() {
+            let id = ids[index] as usize;
+            if metadata[id].as_ref().is_none_or(|old| {
+                accepts_event(
+                    old.kind3_created_at,
+                    &old.kind3_event_id,
+                    node.info.kind3_created_at,
+                    &node.info.kind3_event_id,
+                )
+            }) {
+                let mut targets: Vec<u32> = node
+                    .follows
+                    .into_iter()
+                    .map(|target| ids[target as usize])
+                    .collect();
+                targets.sort_unstable();
+                targets.dedup();
+                topology_changed |= follows[id] != targets;
+                follows[id] = targets;
+                metadata[id] = Some(node.info);
+            }
+            if let Some(list) = node.mutes {
+                if mutes.get(&(id as u32)).is_none_or(|old| {
+                    accepts_event(
+                        old.created_at,
+                        &old.event_id,
+                        list.created_at,
+                        &list.event_id,
+                    )
+                }) {
+                    let mut targets: Vec<u32> = list
+                        .ids
+                        .into_iter()
+                        .map(|target| ids[target as usize])
+                        .collect();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    mutes.insert(
+                        id as u32,
+                        MuteList {
+                            ids: targets,
+                            event_id: list.event_id,
+                            created_at: list.created_at,
+                        },
+                    );
+                    mutes_changed = true;
+                }
+            }
+        }
+        if topology_changed {
+            for list in followers.iter_mut() {
+                list.clear();
+            }
+            for (source, targets) in follows.iter().enumerate() {
+                for &target in targets {
+                    followers[target as usize].push(source as u32);
+                }
+            }
+        }
+        if topology_changed || mutes_changed {
+            self.revision.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[allow(dead_code)] // Public API for explicit node creation and benchmarks
     pub fn get_or_create_node(&self, pubkey: &str) -> u32 {
         // Fast path: check if already exists
         if let Some(id) = self.pubkey_to_id.get(pubkey) {

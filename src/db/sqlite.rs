@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::{debug, info};
 
+use crate::graph::store::{NodeInfo, SnapshotMuteList, SnapshotNode};
 use crate::graph::WotGraph;
 
 pub struct Database {
@@ -56,7 +57,9 @@ impl Database {
                 updated_at INTEGER NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_nodes_pubkey ON nodes(pubkey);
+            -- UNIQUE(pubkey) already supplies the lookup index. Drop legacy
+            -- duplicates without rewriting or vacuuming the database.
+            DROP INDEX IF EXISTS idx_nodes_pubkey;
 
             CREATE TABLE IF NOT EXISTS edges (
                 follower_id INTEGER NOT NULL,
@@ -66,7 +69,8 @@ impl Database {
                 FOREIGN KEY (followed_id) REFERENCES nodes(id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_edges_follower ON edges(follower_id);
+            -- The composite primary key supports lookups by its leading column.
+            DROP INDEX IF EXISTS idx_edges_follower;
             CREATE INDEX IF NOT EXISTS idx_edges_followed ON edges(followed_id);
 
             CREATE TABLE IF NOT EXISTS mute_lists (
@@ -110,69 +114,70 @@ impl Database {
             .enumerate()
             .map(|(index, (id, _, _, _))| (*id, index))
             .collect();
-        // Read numeric edges directly: no GROUP_CONCAT buffers or pubkey SQL joins.
+        anyhow::ensure!(
+            nodes.len() <= u32::MAX as usize,
+            "Database has too many nodes"
+        );
+        let mut snapshot: Vec<SnapshotNode> = nodes
+            .into_iter()
+            .map(|(_, pubkey, event_id, created_at)| SnapshotNode {
+                pubkey,
+                info: NodeInfo {
+                    kind3_event_id: event_id,
+                    kind3_created_at: created_at,
+                },
+                follows: Vec::new(),
+                mutes: None,
+            })
+            .collect();
+        // Stream directly into compact numeric adjacency. Validate everything
+        // before publishing; no edge-sized tuple buffer or pubkey round trip.
         let mut edge_stmt = conn.prepare(
             "SELECT follower_id, followed_id FROM edges ORDER BY follower_id, followed_id",
         )?;
-        let edges: Vec<(i64, i64)> = edge_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
+        let mut rows = edge_stmt.query([])?;
+        let mut edge_count = 0;
+        while let Some(row) = rows.next()? {
+            let from: i64 = row.get(0)?;
+            let to: i64 = row.get(1)?;
+            let (Some(&from), Some(&to)) = (node_indices.get(&from), node_indices.get(&to)) else {
+                anyhow::bail!("Database contains an edge referencing a missing node");
+            };
+            snapshot[from].follows.push(to as u32);
+            edge_count += 1;
+        }
         let mut mute_stmt = conn.prepare(
             "SELECT follower_id, event_id, created_at FROM mute_lists ORDER BY follower_id",
         )?;
-        let mute_lists: Vec<(i64, Option<String>, Option<i64>)> = mute_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?;
+        let mut rows = mute_stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let author: i64 = row.get(0)?;
+            let Some(&author) = node_indices.get(&author) else {
+                anyhow::bail!("Database contains invalid mute metadata");
+            };
+            snapshot[author].mutes = Some(SnapshotMuteList {
+                ids: Vec::new(),
+                event_id: row.get(1)?,
+                created_at: row.get(2)?,
+            });
+        }
         let mut mute_edge_stmt = conn.prepare(
             "SELECT follower_id, followed_id FROM mute_edges ORDER BY follower_id, followed_id",
         )?;
-        let mute_edges: Vec<(i64, i64)> = mute_edge_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let mute_authors: HashSet<i64> = mute_lists.iter().map(|list| list.0).collect();
-        for (from, to) in &mute_edges {
-            anyhow::ensure!(
-                mute_authors.contains(from) && node_indices.contains_key(to),
-                "Database contains invalid mute edges"
-            );
+        let mut rows = mute_edge_stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let from: i64 = row.get(0)?;
+            let to: i64 = row.get(1)?;
+            let (Some(&from), Some(&to)) = (node_indices.get(&from), node_indices.get(&to)) else {
+                anyhow::bail!("Database contains invalid mute edges");
+            };
+            let Some(list) = snapshot[from].mutes.as_mut() else {
+                anyhow::bail!("Database contains invalid mute edges");
+            };
+            list.ids.push(to as u32);
         }
-        for (author, _, _) in &mute_lists {
-            anyhow::ensure!(
-                node_indices.contains_key(author),
-                "Database contains invalid mute metadata"
-            );
-        }
-        // Validate the complete snapshot before changing the graph.
-        for (from, to) in &edges {
-            anyhow::ensure!(
-                node_indices.contains_key(from) && node_indices.contains_key(to),
-                "Database contains an edge referencing a missing node"
-            );
-        }
-        for (_, pubkey, _, _) in &nodes {
-            graph.get_or_create_node(pubkey);
-        }
-        let mut edge_index = 0;
-        for (id, pubkey, event_id, created_at) in &nodes {
-            let mut follows = Vec::new();
-            while edge_index < edges.len() && edges[edge_index].0 == *id {
-                let followed_index = node_indices[&edges[edge_index].1];
-                follows.push(nodes[followed_index].1.clone());
-                edge_index += 1;
-            }
-            // Empty follow lists still carry replaceable-event provenance.
-            graph.update_follows(pubkey, &follows, event_id.clone(), *created_at);
-        }
-        let mut mute_index = 0;
-        for (id, event_id, created_at) in mute_lists {
-            let mut muted = Vec::new();
-            while mute_index < mute_edges.len() && mute_edges[mute_index].0 == id {
-                muted.push(nodes[node_indices[&mute_edges[mute_index].1]].1.clone());
-                mute_index += 1;
-            }
-            graph.update_mutes(&nodes[node_indices[&id]].1, &muted, event_id, created_at);
-        }
-        info!("Loaded {} edges from database", edges.len());
+        graph.restore_nodes(snapshot);
+        info!("Loaded {} edges from database", edge_count);
         Ok(())
     }
 
@@ -288,6 +293,9 @@ impl Database {
             let mut insert_edge = tx.prepare_cached(&format!(
                 "INSERT INTO {edge_table} (follower_id, followed_id) VALUES (?1, ?2)"
             ))?;
+            // A transaction-local cache avoids repeated insert/lookups for shared
+            // targets. It cannot become stale across rollback or other writers.
+            let mut node_ids: HashMap<&str, i64> = HashMap::new();
             for update in winners.values() {
                 let existing: Option<(i64, Option<String>, Option<i64>)> = get_node
                     .query_row(params![update.pubkey], |row| {
@@ -310,6 +318,7 @@ impl Database {
                 ])?;
                 let follower_id: i64 =
                     get_node.query_row(params![update.pubkey], |row| row.get(0))?;
+                node_ids.insert(update.pubkey, follower_id);
                 let previous: HashMap<String, i64> = old_edges
                     .query_map(params![follower_id], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
@@ -321,9 +330,15 @@ impl Database {
                 }
                 for pubkey in desired {
                     if !previous.contains_key(pubkey) {
-                        insert_node.execute(params![pubkey, now])?;
-                        let followed_id: i64 =
-                            get_node.query_row(params![pubkey], |row| row.get(0))?;
+                        let followed_id = match node_ids.get(pubkey) {
+                            Some(&id) => id,
+                            None => {
+                                insert_node.execute(params![pubkey, now])?;
+                                let id = get_node.query_row(params![pubkey], |row| row.get(0))?;
+                                node_ids.insert(pubkey, id);
+                                id
+                            }
+                        };
                         insert_edge.execute(params![follower_id, followed_id])?;
                     }
                 }
@@ -430,6 +445,51 @@ mod tests {
     }
 
     #[test]
+    fn opening_legacy_database_removes_only_redundant_indexes() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(file.path()).unwrap();
+            db.update_follows("a", &["b".into()], Some("aa"), Some(1))
+                .unwrap();
+            db.conn
+                .lock()
+                .execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_nodes_pubkey ON nodes(pubkey);
+                 -- The composite primary key supports lookups by its leading column.
+            DROP INDEX IF EXISTS idx_edges_follower;",
+                )
+                .unwrap();
+        }
+        let db = Database::open(file.path()).unwrap();
+        let conn = db.conn.lock();
+        let redundant: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('idx_nodes_pubkey', 'idx_edges_follower')", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(redundant, 0);
+        for (sql, expected) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE pubkey = 'a'",
+                "sqlite_autoindex_nodes_1",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT followed_id FROM edges WHERE follower_id = 1",
+                "sqlite_autoindex_edges_1",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT follower_id FROM edges WHERE followed_id = 2",
+                "idx_edges_followed",
+            ),
+        ] {
+            let plan: String = conn.query_row(sql, [], |row| row.get(3)).unwrap();
+            assert!(plan.contains("SEARCH") && plan.contains(expected), "{plan}");
+        }
+        drop(conn);
+        let graph = WotGraph::new();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(graph.get_follows("a"), Some(vec!["b".into()]));
+    }
+
+    #[test]
     fn test_upsert_node() {
         let temp_file = NamedTempFile::new().unwrap();
         let db = Database::open(temp_file.path()).unwrap();
@@ -478,6 +538,61 @@ mod tests {
         let stats = graph.stats();
         assert_eq!(stats.node_count, 3);
         assert_eq!(stats.edge_count, 2);
+    }
+
+    #[test]
+    fn numeric_restore_handles_sparse_ids_and_merges_newer_live_events() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn.lock().execute_batch(
+            "INSERT INTO nodes VALUES (10, 'a', 'aa', 20, 0), (40, 'b', 'aa', 20, 0), (90, 'c', NULL, NULL, 0);
+             INSERT INTO edges VALUES (10, 40), (40, 40), (40, 90);
+             INSERT INTO mute_lists VALUES (10, 'aa', 20, 0), (40, 'aa', 20, 0);
+             INSERT INTO mute_edges VALUES (10, 90);"
+        ).unwrap();
+        let graph = WotGraph::new();
+        // Force IDs to differ from the database order, retain unrelated edges,
+        // and verify stale snapshot lists cannot replace newer live events.
+        graph.update_follows("c", &["extra".into()], Some("aa".into()), Some(30));
+        graph.update_follows("a", &["c".into()], Some("aa".into()), Some(30));
+        graph.update_mutes("a", &[], Some("aa".into()), Some(30));
+        let before = graph.revision();
+        db.load_graph(&graph).unwrap();
+        assert!(graph.revision() > before);
+        assert_eq!(graph.get_follows("a"), Some(vec!["c".into()]));
+        assert_eq!(graph.get_follows("c"), Some(vec!["extra".into()]));
+        assert_eq!(graph.get_follows("b"), Some(vec!["c".into(), "b".into()]));
+        assert_eq!(graph.get_followers("c"), Some(vec!["a".into(), "b".into()]));
+        assert_eq!(graph.get_followers("b"), Some(vec!["b".into()]));
+        assert_eq!(graph.get_mutes_page("a", 0, 10), Some((vec![], 0)));
+        assert_eq!(graph.get_mutes_page("b", 0, 10), Some((vec![], 0)));
+        let before = graph.revision();
+        db.load_graph(&graph).unwrap();
+        assert_eq!(graph.revision(), before);
+        // Deltas still work after bulk reverse-index construction.
+        graph.update_follows("b", &[], Some("bb".into()), Some(21));
+        assert_eq!(graph.get_followers("b"), Some(vec![]));
+        assert_eq!(graph.get_followers("c"), Some(vec!["a".into()]));
+    }
+
+    #[test]
+    fn corrupt_mute_snapshot_does_not_publish_follow_edges() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .lock()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+             INSERT INTO nodes VALUES (1, 'a', 'aa', 20, 0), (2, 'b', NULL, NULL, 0);
+             INSERT INTO edges VALUES (1, 2);
+             INSERT INTO mute_edges VALUES (1, 2);",
+            )
+            .unwrap();
+        let graph = WotGraph::new();
+        graph.update_follows("existing", &["target".into()], Some("aa".into()), Some(1));
+        let before = graph.revision();
+        assert!(db.load_graph(&graph).is_err());
+        assert_eq!(graph.get_node_id("a"), None);
+        assert_eq!(graph.revision(), before);
+        assert_eq!(graph.get_follows("existing"), Some(vec!["target".into()]));
     }
 
     #[test]
