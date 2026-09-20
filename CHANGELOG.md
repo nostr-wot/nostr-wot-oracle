@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.1] - 2026-09-20
+
+### Changed
+- Restore SQLite edges directly into numeric adjacency and build reverse lists once, avoiding per-edge pubkey allocations and sorted reverse-list insertion during startup.
+- Cache target node IDs within persistence transactions and remove redundant pubkey/follower indexes already covered by SQLite unique/primary-key indexes. Existing database free pages remain reusable without an automatic vacuum.
+- Coalesce received follow and mute events before both persistence and graph publication, preventing superseded targets from creating extra in-memory nodes.
+- Run all distinct batch-distance cache misses in one bounded worker while preserving request order, duplicates, cache behavior and query options.
+- Add a reproducible graph/storage benchmark and regression coverage for sparse database IDs, merging newer live events, invalid mute snapshots and index migration.
+
 ## [0.3.0] - 2026-09-19
 
 ### Added

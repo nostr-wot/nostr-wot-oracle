@@ -10,12 +10,16 @@ Bidirectional BFS expands the smaller frontier and counts shortest paths through
 
 ## Persistence
 
-Each author/kind has independent replaceable-event ordering. SQLite transactions select the winning event per author, compare with persisted provenance, and insert/delete changed edges. Reload reads numeric edges and restores all metadata, including empty lists. Schema additions for public mutes preserve existing follow data.
+Each author/kind has independent replaceable-event ordering. SQLite transactions select the winning event per author, compare with persisted provenance, and insert/delete changed edges. Reload streams numeric edges into compact adjacency and validates the whole snapshot before publication. Under the graph writer lock, it maps snapshot IDs once, preserves newer live events, and rebuilds reverse adjacency in source-ID order. It restores all metadata, including empty lists. Transaction-local target ID caching avoids repeated SQL lookups for shared targets. UNIQUE(pubkey) and PRIMARY KEY(follower_id, followed_id) supply forward lookup indexes; redundant legacy indexes are dropped, retaining reverse indexes. Dropped pages remain reusable; startup does not run VACUUM. Schema additions for public mutes preserve existing follow data.
 
-Ingestion parses bounded batches, commits before publishing to the graph, retries failures and exits on persistent errors. Signals trigger a drain. Detailed sync limitations are in [SYNC.md](SYNC.md).
+Ingestion parses bounded batches, selects one winning event per author/kind before persistence and graph publication, commits before publishing to the graph, retries failures and exits on persistent errors. Signals trigger a drain. Detailed sync limitations are in [SYNC.md](SYNC.md).
 
 ## Cache and API
+
+Batch distance queries deduplicate targets and reuse cache hits, sending all remaining targets to one blocking task with one shared query permit. Results retain input order and duplicate entries; fully cached batches need no worker. Each target still uses bidirectional BFS.
 
 Moka bounds cache size and TTL. Computations capture their starting graph revision; only results for an unchanged revision may be inserted, and reads reject stale generations. `/distance` remains follow-only. `/trust` combines independently observed distance and public mute evidence without assigning a numeric score. Private mute entries are unavailable.
 
 The application exposes process liveness, ingestion readiness and graph/sync metrics separately. Production deployment uses a localhost container port behind nginx/HTTPS with persistent storage and restart supervision.
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the synthetic benchmark, measured changes and remaining limitations.

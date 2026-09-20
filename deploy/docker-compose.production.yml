@@ -1,6 +1,6 @@
 services:
   oracle:
-    image: ghcr.io/nostr-wot/nostr-wot-oracle:0.3.0
+    image: ghcr.io/nostr-wot/nostr-wot-oracle:0.3.1
     container_name: nostr-wot-oracle
     restart: unless-stopped
     stop_grace_period: 60s
