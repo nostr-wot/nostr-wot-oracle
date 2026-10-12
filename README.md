@@ -51,4 +51,4 @@ curl 'http://127.0.0.1:8080/trust?from=FROM&to=TO'
 
 See [.env.example](.env.example), [API reference](docs/API.md), [self-hosting](docs/SELF-HOST.md), [sync behavior](docs/SYNC.md), [architecture](docs/ARCHITECTURE.md) and [changelog](CHANGELOG.md).
 
-MIT license.
+GNU General Public License, version 3 only ([GPL-3.0-only](LICENSE)). See [NOTICE.md](NOTICE.md) for preserved notices.
