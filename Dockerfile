@@ -4,7 +4,7 @@ FROM rust:1.93.0-slim-bookworm AS builder
 
 LABEL org.opencontainers.image.source="https://github.com/nostr-wot/nostr-wot-oracle"
 LABEL org.opencontainers.image.description="Pairwise distance queries for Nostr Web of Trust"
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="GPL-3.0-only"
 
 WORKDIR /app
 
